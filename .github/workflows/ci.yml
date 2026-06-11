@@ -1,0 +1,201 @@
+name: CI
+
+on:
+    push:
+        branches: [ "master", "main" ]
+    pull_request:
+        branches: [ "master", "main" ]
+
+env:
+    MIX_ENV: ci
+
+# ── Job defaults ─────────────────────────────────────────────────────────────
+# Each job restores the same deps/build caches keyed on mix.lock so that
+# installing and compiling only happens once per lock-file change.
+
+jobs:
+
+    # ── 1. Build & Test ──────────────────────────────────────────────────────
+    test:
+        name: Test (OTP ${{ matrix.otp }} / Elixir ${{ matrix.elixir }})
+        runs-on: ubuntu-latest
+
+        strategy:
+            fail-fast: false
+            matrix:
+                otp: [ "29.x" ]
+                elixir: [ "1.19.x" ]
+
+        steps:
+            -   name: Checkout
+                uses: actions/checkout@v4
+
+            -   name: Set up Erlang/OTP and Elixir
+                uses: erlef/setup-beam@v1
+                with:
+                    otp-version: ${{ matrix.otp }}
+                    elixir-version: ${{ matrix.elixir }}
+
+            -   name: Restore deps cache
+                uses: actions/cache@v4
+                with:
+                    path: deps
+                    key: ${{ runner.os }}-mix-${{ matrix.otp }}-${{ matrix.elixir }}-${{ hashFiles('**/mix.lock') }}
+                    restore-keys: |
+                        ${{ runner.os }}-mix-${{ matrix.otp }}-${{ matrix.elixir }}-
+
+            -   name: Restore build cache
+                uses: actions/cache@v4
+                with:
+                    path: _build
+                    key: ${{ runner.os }}-build-${{ matrix.otp }}-${{ matrix.elixir }}-${{ hashFiles('**/mix.lock') }}
+                    restore-keys: |
+                        ${{ runner.os }}-build-${{ matrix.otp }}-${{ matrix.elixir }}-
+
+            -   name: Install dependencies
+                run: mix deps.get
+
+            -   name: Compile (warnings as errors)
+                run: mix compile --warnings-as-errors
+
+            -   name: Check code formatting
+                run: mix format --check-formatted
+
+            -   name: Unit tests
+                run: mix test.unit
+
+            -   name: Integration tests
+                run: mix test.integration
+
+            -   name: E2E tests
+                run: mix test.e2e
+
+            -   name: Gherkin BDD tests
+                run: mix test.gherkin
+
+    # ── 2. Security ──────────────────────────────────────────────────────────
+    # Runs only on the primary version; no point duplicating across the matrix.
+    security:
+        name: Security Audit
+        needs: test
+        runs-on: ubuntu-latest
+
+        env:
+            MIX_ENV: dev
+
+        steps:
+            -   name: Checkout
+                uses: actions/checkout@v4
+
+            -   name: Set up Erlang/OTP and Elixir
+                uses: erlef/setup-beam@v1
+                with:
+                    otp-version: "29.x"
+                    elixir-version: "1.19.x"
+
+            -   name: Restore deps cache
+                uses: actions/cache@v4
+                with:
+                    path: deps
+                    key: ${{ runner.os }}-mix-29.x-1.19.x-${{ hashFiles('**/mix.lock') }}
+                    restore-keys: |
+                        ${{ runner.os }}-mix-29.x-1.19.x-
+
+            -   name: Install dependencies
+                run: mix deps.get
+
+            -   name: Dependency vulnerability audit (mix_audit)
+                run: mix deps.audit
+
+            -   name: Static security analysis (sobelow)
+                run: mix sobelow --config
+
+    # ── 3. Coverage ──────────────────────────────────────────────────────────
+    coverage:
+        name: Test Coverage
+        needs: test
+        runs-on: ubuntu-latest
+
+        env:
+            MIX_ENV: test
+
+        steps:
+            -   name: Checkout
+                uses: actions/checkout@v4
+
+            -   name: Set up Erlang/OTP and Elixir
+                uses: erlef/setup-beam@v1
+                with:
+                    otp-version: "29.x"
+                    elixir-version: "1.19.x"
+
+            -   name: Restore deps cache
+                uses: actions/cache@v4
+                with:
+                    path: deps
+                    key: ${{ runner.os }}-mix-29.x-1.19.x-${{ hashFiles('**/mix.lock') }}
+                    restore-keys: |
+                        ${{ runner.os }}-mix-29.x-1.19.x-
+
+            -   name: Restore build cache
+                uses: actions/cache@v4
+                with:
+                    path: _build
+                    key: ${{ runner.os }}-build-29.x-1.19.x-${{ hashFiles('**/mix.lock') }}
+                    restore-keys: |
+                        ${{ runner.os }}-build-29.x-1.19.x-
+
+            -   name: Install dependencies
+                run: mix deps.get
+
+            -   name: Generate coverage report (ExCoveralls HTML)
+                run: mix coveralls.html
+
+            -   name: Upload coverage report
+                uses: actions/upload-artifact@v4
+                with:
+                    name: coverage-report
+                    path: _build/cover/
+                    retention-days: 30
+
+    # ── 4. Publish to hex.pm ─────────────────────────────────────────────────
+    # Runs only on direct pushes to master (not on PRs) and only after all
+    # other jobs succeed.  Requires the HEX_API_KEY repository secret.
+    #
+    # To generate a CI-specific key:
+    #   mix hex.user key generate --key-name github-ci
+    # Then add the output as a GitHub secret named HEX_API_KEY.
+    publish:
+        name: Publish to hex.pm
+        needs: [ test, security, coverage ]
+        runs-on: ubuntu-latest
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+
+        env:
+            MIX_ENV: dev
+
+        steps:
+            -   name: Checkout
+                uses: actions/checkout@v4
+
+            -   name: Set up Erlang/OTP and Elixir
+                uses: erlef/setup-beam@v1
+                with:
+                    otp-version: "29.x"
+                    elixir-version: "1.19.x"
+
+            -   name: Restore deps cache
+                uses: actions/cache@v4
+                with:
+                    path: deps
+                    key: ${{ runner.os }}-mix-29.x-1.19.x-${{ hashFiles('**/mix.lock') }}
+                    restore-keys: |
+                        ${{ runner.os }}-mix-29.x-1.19.x-
+
+            -   name: Install dependencies
+                run: mix deps.get
+
+            -   name: Publish package and docs to hex.pm
+                run: mix hex.publish --yes
+                env:
+                    HEX_API_KEY: ${{ secrets.HEX_API_KEY }}

@@ -8,3 +8,12 @@ erl_crash.dump
 *.beam
 /config/*.secret.exs
 .elixir_ls/
+.elixir-tools/
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
