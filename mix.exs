@@ -4,7 +4,7 @@ defmodule SetmyInfo.ElixirModuleLoader.MixProject do
   def project do
     [
       app: :elixir_module_loader,
-      version: "0.1.0",
+      version: "1.0.0",
       elixir: "~> 1.17",
       name: "ElixirModuleLoader",
       description:
