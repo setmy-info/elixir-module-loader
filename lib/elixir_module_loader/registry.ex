@@ -19,6 +19,10 @@ defmodule SetmyInfo.ElixirModuleLoader.Registry do
   A key can be registered without having an active Worker (lazy loading), and
   a Worker can be released without removing the key registration (it can be
   reloaded later).
+
+  Compilation serialisation lives in its own process —
+  `SetmyInfo.ElixirModuleLoader.CompileLock` — so a slow compile can never
+  block registry writes.
   """
 
   use GenServer
@@ -47,10 +51,21 @@ defmodule SetmyInfo.ElixirModuleLoader.Registry do
     end
   end
 
-  @doc "Register many `{key, module}` pairs at once — more efficient than repeated `register/2`."
-  @spec register_many([{<<_::128>>, module()}]) :: :ok
+  @doc """
+  Register many `{key, module}` pairs at once — more efficient than repeated
+  `register/2`.
+
+  Every spec must be a `{<<_::128>>, atom}` tuple. If any spec is malformed the
+  whole batch is rejected with `{:error, :invalid_spec}` and nothing is
+  inserted, preserving the 128-bit key contract that `register/2` enforces.
+  """
+  @spec register_many([{<<_::128>>, module()}]) :: :ok | {:error, :invalid_spec}
   def register_many(specs) when is_list(specs) do
-    GenServer.call(__MODULE__, {:register_many, specs})
+    if Enum.all?(specs, &valid_spec?/1) do
+      GenServer.call(__MODULE__, {:register_many, specs})
+    else
+      {:error, :invalid_spec}
+    end
   end
 
   @doc "Remove a key→module mapping. Does NOT unload any active Worker."
@@ -81,7 +96,7 @@ defmodule SetmyInfo.ElixirModuleLoader.Registry do
 
   @impl true
   def init(_init_arg) do
-    :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
+    :ets.new(@table, [:named_table, :protected, :set, read_concurrency: true])
     Logger.debug("[Registry] initialised")
     {:ok, %{}}
   end
@@ -116,4 +131,9 @@ defmodule SetmyInfo.ElixirModuleLoader.Registry do
         {:reply, {:error, :not_found}, state}
     end
   end
+
+  # ── Private ───────────────────────────────────────────────────────────────
+
+  defp valid_spec?({<<_::128>>, module_name}) when is_atom(module_name), do: true
+  defp valid_spec?(_), do: false
 end

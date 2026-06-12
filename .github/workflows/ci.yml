@@ -2,7 +2,7 @@ name: CI
 
 on:
     push:
-        branches: [ "master", "main" ]
+        branches: [ "master", "develop", "feature/**" ]
     pull_request:
         branches: [ "master", "main" ]
 
@@ -194,6 +194,26 @@ jobs:
 
             -   name: Install dependencies
                 run: mix deps.get
+
+            # TEMPORARY DEBUG — remove after the token problem is solved.
+            # Prints length and sha256 of the key (safe — cannot be reversed).
+            # Compare locally with:
+            #   printf '%s' '<your key>' | sha256sum
+            # The permissions call shows whether the key can publish
+            # (needs api:write, not just repository:setmy_info).
+            -   name: "TEMP: probe HEX_API_KEY"
+                run: |
+                    if [ -z "$HEX_API_KEY" ]; then
+                        echo "HEX_API_KEY: NOT SET or empty"
+                        exit 0
+                    fi
+                    echo "HEX_API_KEY: expected sha256: c2bae6107f69333c68b43b3eec2d8b347f890deb6580af6b21de36a21c86d153"
+                    echo "HEX_API_KEY: actual   sha256: $(printf '%s' "$HEX_API_KEY" | sha256sum)"
+                    echo "HEX_API_KEY: permissions according to hex.pm:"
+                    curl -s -H "Authorization: $HEX_API_KEY" https://hex.pm/api/keys | head -c 2000 || true
+                    echo
+                env:
+                    HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
 
             -   name: Publish package and docs to hex.pm
                 run: mix hex.publish --organization setmy_info --yes

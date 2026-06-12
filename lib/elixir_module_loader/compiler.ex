@@ -15,6 +15,26 @@ defmodule SetmyInfo.ElixirModuleLoader.Compiler do
   * `from_beam_binary/2` — load a BEAM binary already in memory (e.g.
     received over the network).
 
+  ## Concurrency
+
+  Source/file compilation toggles the **VM-global** `:ignore_module_conflict`
+  compiler option. That flag is not process-local, so two callers compiling at
+  the same time can clobber each other's setting. To make compilation
+  process-safe, `from_source/1` and `from_file/1` run their critical section
+  serialised through the `SetmyInfo.ElixirModuleLoader.CompileLock` GenServer —
+  only one compilation toggles the flag at a time. The previous flag value is
+  saved and restored, so a host application's own compiler settings are never
+  clobbered.
+
+  Note this only serialises compilations going through this library. Code in
+  the host application that calls `Code.compile_string/1` directly (or an IEx
+  recompile) still races on the same global flag — that is outside this
+  library's control.
+
+  The BEAM-binary loaders (`from_beam_file/1`, `from_beam_binary/2`) do **not**
+  touch the global flag; they go straight to the code server, which the VM
+  already serialises, so they are safe to call concurrently.
+
   ## Hot reload
 
   The BEAM supports two live versions of any module simultaneously.
@@ -23,59 +43,68 @@ defmodule SetmyInfo.ElixirModuleLoader.Compiler do
   call without a restart.
   """
 
+  alias SetmyInfo.ElixirModuleLoader.CompileLock
+
   require Logger
+
+  # Compilation can be slow; allow well beyond the 5s GenServer.call default.
+  @compile_timeout 60_000
 
   @doc """
   Compile an Elixir source string and load all defined modules into the VM.
 
   Returns `{:ok, [{module, binary}]}` on success. Modules are immediately
-  callable after this returns.
+  callable after this returns. Serialised through the CompileLock GenServer so
+  concurrent callers cannot corrupt the global compiler flag.
   """
   @spec from_source(String.t()) :: {:ok, [{module(), binary()}]} | {:error, term()}
   def from_source(elixir_source) when is_binary(elixir_source) do
-    Code.put_compiler_option(:ignore_module_conflict, true)
+    GenServer.call(CompileLock, {:compile, {:source, elixir_source}}, @compile_timeout)
+  end
 
-    try do
+  @doc """
+  Compile an Elixir .ex source file and load all defined modules into the VM.
+
+  Returns `{:ok, [{module, binary}]}` on success. Serialised through the
+  CompileLock GenServer (see the module's Concurrency section).
+  """
+  @spec from_file(Path.t()) :: {:ok, [{module(), binary()}]} | {:error, term()}
+  def from_file(path) when is_binary(path) do
+    GenServer.call(CompileLock, {:compile, {:file, path}}, @compile_timeout)
+  end
+
+  @doc false
+  # Raw compilation critical section. Invoked ONLY from inside the CompileLock
+  # GenServer (via the `{:compile, _}` call) so that the VM-global
+  # `:ignore_module_conflict` flag is never toggled by two processes at once.
+  # Do not call directly — use `from_source/1` / `from_file/1`.
+  @spec run_compile({:source, String.t()} | {:file, Path.t()}) ::
+          {:ok, [{module(), binary()}]} | {:error, term()}
+  def run_compile({:source, elixir_source}) do
+    with_conflict_ignored(fn ->
       modules = Code.compile_string(elixir_source)
 
       Logger.info(
         "[Compiler] loaded #{length(modules)} module(s) from source: #{module_names(modules)}"
       )
 
-      {:ok, modules}
-    rescue
-      e ->
-        Logger.warning("[Compiler] compile error: #{Exception.message(e)}")
-        {:error, e}
-    after
-      Code.put_compiler_option(:ignore_module_conflict, false)
-    end
+      modules
+    end)
   end
 
-  @doc """
-  Compile an Elixir .ex source file and load all defined modules into the VM.
+  def run_compile({:file, path}) do
+    with_conflict_ignored(
+      fn ->
+        modules = Code.compile_file(path)
 
-  Returns `{:ok, [{module, binary}]}` on success.
-  """
-  @spec from_file(Path.t()) :: {:ok, [{module(), binary()}]} | {:error, term()}
-  def from_file(path) when is_binary(path) do
-    Code.put_compiler_option(:ignore_module_conflict, true)
+        Logger.info(
+          "[Compiler] loaded #{length(modules)} module(s) from #{path}: #{module_names(modules)}"
+        )
 
-    try do
-      modules = Code.compile_file(path)
-
-      Logger.info(
-        "[Compiler] loaded #{length(modules)} module(s) from #{path}: #{module_names(modules)}"
-      )
-
-      {:ok, modules}
-    rescue
-      e ->
-        Logger.warning("[Compiler] compile error from file #{path}: #{Exception.message(e)}")
-        {:error, e}
-    after
-      Code.put_compiler_option(:ignore_module_conflict, false)
-    end
+        modules
+      end,
+      "from file #{path}"
+    )
   end
 
   @doc """
@@ -94,7 +123,7 @@ defmodule SetmyInfo.ElixirModuleLoader.Compiler do
         {:ok, module_name}
 
       {:error, reason} ->
-        Logger.warning("[Compiler] failed to load from #{path}: #{inspect(reason)}")
+        Logger.error("[Compiler] failed to load from #{path}: #{inspect(reason)}")
         {:error, reason}
     end
   end
@@ -115,7 +144,7 @@ defmodule SetmyInfo.ElixirModuleLoader.Compiler do
         :ok
 
       {:error, reason} ->
-        Logger.warning("[Compiler] failed to load #{module_name}: #{inspect(reason)}")
+        Logger.error("[Compiler] failed to load #{module_name}: #{inspect(reason)}")
         {:error, reason}
     end
   end
@@ -141,6 +170,24 @@ defmodule SetmyInfo.ElixirModuleLoader.Compiler do
   end
 
   # ── Private ───────────────────────────────────────────────────────────────
+
+  # Runs `fun` with the global `:ignore_module_conflict` flag enabled and
+  # guarantees the host application's previous value is restored afterwards.
+  # Caller must already hold the compile serialisation lock.
+  defp with_conflict_ignored(fun, context \\ "from source") do
+    previous = Code.get_compiler_option(:ignore_module_conflict)
+    Code.put_compiler_option(:ignore_module_conflict, true)
+
+    try do
+      {:ok, fun.()}
+    rescue
+      e ->
+        Logger.error("[Compiler] compile error #{context}: #{Exception.message(e)}")
+        {:error, e}
+    after
+      Code.put_compiler_option(:ignore_module_conflict, previous)
+    end
+  end
 
   defp module_names(modules) do
     modules |> Enum.map(fn {name, _} -> name end) |> Enum.join(", ")

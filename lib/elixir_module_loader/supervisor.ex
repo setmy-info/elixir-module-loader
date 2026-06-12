@@ -6,11 +6,13 @@ defmodule SetmyInfo.ElixirModuleLoader.Supervisor do
   - `SetmyInfo.ElixirModuleLoader.Registry` (GenServer) — 128-bit key → module atom, ETS-backed
   - `SetmyInfo.ElixirModuleLoader.DynamicSupervisor` — starts/stops Worker processes on demand
   - `SetmyInfo.ElixirModuleLoader.Loader` (GenServer) — tracks loaded modules in ETS
+  - `SetmyInfo.ElixirModuleLoader.CompileLock` (GenServer) — serialises runtime compilation
 
   Restart strategy is `:rest_for_one`:
-  - Registry crash → DynamicSupervisor + Loader restart (Workers terminated, ETS rebuilt)
-  - DynamicSupervisor crash → Loader restarts; reconciles with WorkerRegistry
-  - Loader crash → only Loader restarts; Workers survive, Loader reconciles
+  - Registry crash → DynamicSupervisor + Loader + CompileLock restart (Workers terminated, ETS rebuilt)
+  - DynamicSupervisor crash → Loader + CompileLock restart; Loader reconciles with WorkerRegistry
+  - Loader crash → Loader + CompileLock restart; Workers survive, Loader reconciles
+  - CompileLock crash → only CompileLock restarts (it is stateless)
   """
 
   use Supervisor
@@ -25,7 +27,8 @@ defmodule SetmyInfo.ElixirModuleLoader.Supervisor do
       SetmyInfo.ElixirModuleLoader.Registry,
       {DynamicSupervisor,
        name: SetmyInfo.ElixirModuleLoader.DynamicSupervisor, strategy: :one_for_one},
-      SetmyInfo.ElixirModuleLoader.Loader
+      SetmyInfo.ElixirModuleLoader.Loader,
+      SetmyInfo.ElixirModuleLoader.CompileLock
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)

@@ -61,8 +61,17 @@ defmodule SetmyInfo.ElixirModuleLoader.LoaderTest do
     assert {:error, :not_loaded} = Loader.pid_for(key)
   end
 
+  @tag capture_log: true
   test "load/1 returns error when key is not registered" do
     unregistered = :crypto.strong_rand_bytes(16)
     assert {:error, :not_found} = Loader.load(unregistered)
+  end
+
+  test "list_loaded/0 contains key after load, not after release", %{key: key} do
+    refute key in Loader.list_loaded()
+    Loader.load(key)
+    assert key in Loader.list_loaded()
+    Loader.release(key)
+    refute key in Loader.list_loaded()
   end
 end

@@ -9,14 +9,28 @@ defmodule SetmyInfo.ElixirModuleLoader.Loader do
   * **Release** — terminates the Worker and removes the ETS entry.
   * **Reload** — terminates any running Worker and starts a fresh one; useful
     after a hot code swap where Worker state also needs resetting.
+  * **Self-healing** — the Loader monitors every Worker it starts. If a Worker
+    dies outside of `release/1` (e.g. it is killed, or its supervisor restarts
+    it), the `:DOWN` message removes the stale ETS entry so `loaded?/1` and
+    `pid_for/1` never report a dead PID.
   * **Crash recovery** — on restart, reconciles its ETS table from the live
-    WorkerRegistry so orphaned Workers are re-tracked immediately.
+    WorkerRegistry so orphaned Workers are re-tracked (and re-monitored)
+    immediately.
 
   ## Concurrency
 
-  ETS is `:public` so `loaded?/1`, `list_loaded/0`, and `pid_for/1` bypass the
-  GenServer mailbox (O(1)). All mutations go through `GenServer.call` to ensure
-  serialisation and atomicity.
+  ETS is `:protected` — `loaded?/1`, `list_loaded/0`, and `pid_for/1` read it
+  from any process without touching the GenServer mailbox (O(1)), while only
+  the Loader process itself can write. All mutations go through
+  `GenServer.call` to ensure serialisation and atomicity.
+
+  > #### Dead-PID window {: .warning}
+  >
+  > Between a Worker dying and the Loader processing its `:DOWN` message there
+  > is a brief window where `loaded?/1` returns `true` and `pid_for/1` returns
+  > a PID that is no longer alive. `Worker.execute/4` tolerates this (it
+  > returns `{:error, :not_loaded}` on `:noproc`), but callers using
+  > `pid_for/1` directly must be prepared for the PID to be dead.
 
   ## Lifecycle
 
@@ -82,9 +96,9 @@ defmodule SetmyInfo.ElixirModuleLoader.Loader do
 
   @impl true
   def init(_init_arg) do
-    :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
-    reconcile_with_worker_registry()
-    {:ok, %{}}
+    :ets.new(@table, [:named_table, :protected, :set, read_concurrency: true])
+    monitors = reconcile_with_worker_registry()
+    {:ok, %{monitors: monitors}}
   end
 
   @impl true
@@ -94,25 +108,51 @@ defmodule SetmyInfo.ElixirModuleLoader.Loader do
         {:reply, {:ok, pid}, state}
 
       [] ->
-        {:reply, start_worker(key), state}
+        case start_worker(key) do
+          {:ok, pid} = ok -> {:reply, ok, monitor_worker(state, key, pid)}
+          error -> {:reply, error, state}
+        end
     end
   end
 
   @impl true
   def handle_call({:reload, key}, _from, state) do
-    terminate_worker(key)
-    {:reply, start_worker(key), state}
+    state = terminate_worker(key, state)
+
+    case start_worker(key) do
+      {:ok, pid} = ok -> {:reply, ok, monitor_worker(state, key, pid)}
+      error -> {:reply, error, state}
+    end
   end
 
   @impl true
   def handle_call({:release, key}, _from, state) do
     case :ets.lookup(@table, key) do
       [{^key, _pid}] ->
-        terminate_worker(key)
-        {:reply, :ok, state}
+        {:reply, :ok, terminate_worker(key, state)}
 
       [] ->
         {:reply, {:error, :not_loaded}, state}
+    end
+  end
+
+  @impl true
+  def handle_info({:DOWN, _ref, :process, pid, reason}, state) do
+    case Map.pop(state.monitors, pid) do
+      {{key, _ref}, monitors} ->
+        # Worker died outside of release/1 — drop the stale ETS entry so
+        # loaded?/1 and pid_for/1 stop reporting a dead PID.
+        :ets.match_delete(@table, {key, pid})
+
+        Logger.warning(
+          "[Loader] worker #{Base.encode16(key)} (#{inspect(pid)}) went down " <>
+            "(#{inspect(reason)}); cleaned up tracking"
+        )
+
+        {:noreply, %{state | monitors: monitors}}
+
+      {nil, _monitors} ->
+        {:noreply, state}
     end
   end
 
@@ -134,26 +174,56 @@ defmodule SetmyInfo.ElixirModuleLoader.Loader do
 
             {:ok, pid}
 
+          {:error, {:already_started, pid}} ->
+            # A Worker is already registered under this key's via-name (e.g. a
+            # survivor that was reconciled, or a concurrent reload). Adopt it.
+            :ets.insert(@table, {key, pid})
+
+            Logger.info(
+              "[Loader] adopted already-started worker #{Base.encode16(key)} (#{inspect(pid)})"
+            )
+
+            {:ok, pid}
+
           {:error, reason} = error ->
             Logger.warning("[Loader] failed to load #{Base.encode16(key)}: #{inspect(reason)}")
             error
         end
 
       {:error, :not_found} = error ->
-        Logger.warning("[Loader] key #{Base.encode16(key)} is not registered in Registry")
+        Logger.error("[Loader] key #{Base.encode16(key)} is not registered in Registry")
         error
     end
   end
 
-  defp terminate_worker(key) do
+  defp terminate_worker(key, state) do
     case :ets.lookup(@table, key) do
       [{^key, pid}] ->
+        state = demonitor_worker(state, pid)
         DynamicSupervisor.terminate_child(SetmyInfo.ElixirModuleLoader.DynamicSupervisor, pid)
         :ets.delete(@table, key)
         Logger.info("[Loader] released #{Base.encode16(key)} (#{inspect(pid)})")
+        state
 
       [] ->
-        :ok
+        state
+    end
+  end
+
+  defp monitor_worker(state, key, pid) do
+    ref = Process.monitor(pid)
+    %{state | monitors: Map.put(state.monitors, pid, {key, ref})}
+  end
+
+  defp demonitor_worker(state, pid) do
+    case Map.pop(state.monitors, pid) do
+      {{_key, ref}, monitors} ->
+        # Flush so we never act on a :DOWN for a Worker we deliberately stopped.
+        Process.demonitor(ref, [:flush])
+        %{state | monitors: monitors}
+
+      {nil, _monitors} ->
+        state
     end
   end
 
@@ -170,5 +240,9 @@ defmodule SetmyInfo.ElixirModuleLoader.Loader do
         "[Loader] reconciled #{length(entries)} surviving Worker(s) from WorkerRegistry"
       )
     end
+
+    Map.new(entries, fn {key, pid} ->
+      {pid, {key, Process.monitor(pid)}}
+    end)
   end
 end
