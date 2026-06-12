@@ -85,7 +85,7 @@ library.
 | `apps/core_logic/` (Ecto / DB)                | Not created                                   | Omitted — no DB |
 | `apps/lessons/`                               | Not created                                   | Omitted — scope |
 | GitHub Actions CI                             | `.github/workflows/ci.yml` (4-job)            | Added (new)     |
-| Bitbucket Pipelines                           | `bitbucket-pipelines.yml` (4-stage)           | Added (new)     |
+| Bitbucket Pipelines                           | Not included                                  | Not used        |
 | `mix.exs package/0`                           | Added for hex.pm publishing                   | Added (new)     |
 
 **Note 1 — `.sobelow-conf`**: The template configures sobelow with a specific
@@ -206,8 +206,6 @@ The template has no CI configuration. This project adds:
 
 - `.github/workflows/ci.yml` — 4-job GitHub Actions pipeline:
   test (OTP×Elixir matrix) → security → coverage → publish (master only)
-- `bitbucket-pipelines.yml` — 4-stage Bitbucket Pipelines:
-  test (compile + format + unit/integration/e2e/gherkin) → security → coverage → publish (master only)
 
 ---
 
@@ -308,10 +306,9 @@ taken over, what was adapted, and what differs intentionally.
 
 ### CI pipelines (added, not in template)
 
-| File                         | Platform    | Jobs/stages                                          |
-|------------------------------|-------------|------------------------------------------------------|
-| `.github/workflows/ci.yml`   | GitHub      | test (matrix) → security → coverage → publish        |
-| `bitbucket-pipelines.yml`    | Bitbucket   | test → security → coverage → publish (master only)   |
+| File                       | Platform | Jobs/stages                                   |
+|----------------------------|----------|-----------------------------------------------|
+| `.github/workflows/ci.yml` | GitHub   | test → security → coverage → publish (master) |
 
 ### Environments (same as elixir-start-project)
 

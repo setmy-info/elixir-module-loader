@@ -111,6 +111,20 @@ To also reset Worker state (call count, etc.), use `reload/1`:
 ## Development commands
 
 ```bash
+mix deps.get           # install dependencies
+mix compile            # compile all source files
+mix format             # format source files
+mix test.unit          # unit tests
+mix test.integration   # integration tests
+mix test.e2e           # e2e + Gherkin BDD tests
+mix test.gherkin       # Gherkin/Cucumber only
+mix test.all           # all tests
+mix validate           # compile --warnings-as-errors + format check
+mix test.coverage      # ExCoveralls HTML report → _build/cover/
+mix test.mutation      # Muzak mutation testing
+mix audit              # dependency vulnerability scan (mix_audit)
+mix security           # static security analysis (sobelow)
+mix docs               # ExDoc HTML → _build/doc/
 ```
 
 ---
@@ -242,59 +256,6 @@ Add a publish job to `.github/workflows/ci.yml`:
               env:
                   HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
 ```
-
-### CI auto-publish (Bitbucket Pipelines)
-
-Bitbucket Pipelines is configured by `bitbucket-pipelines.yml` at the
-repository root. The file is already included in this project.
-
-#### 1 — Generate a hex.pm CI key
-
-```bash
-mix hex.user key generate --key-name bitbucket-ci
-```
-
-Copy the printed key — it is shown only once.
-
-#### 2 — Store the key as a repository variable
-
-1. Open your Bitbucket repository.
-2. Go to **Repository settings → Repository variables**.
-3. Add a variable:
-    - **Name:** `HEX_API_KEY`
-    - **Value:** the key from step 1
-    - **Secured:** ✓ (hides it from logs)
-
-For workspace-level reuse across multiple repositories add it instead under
-**Workspace settings → Workspace variables**.
-
-For environment-scoped control (e.g. staging vs production):
-
-1. Go to **Repository settings → Deployments**.
-2. Create an environment named `production`.
-3. Add `HEX_API_KEY` as a deployment variable there.
-4. Reference it in the pipeline step with `deployment: production`.
-
-#### 3 — Enable Pipelines
-
-1. Go to **Repository settings → Pipelines → Settings**.
-2. Toggle **Enable Pipelines** on.
-
-#### 4 — Pipeline structure
-
-The included `bitbucket-pipelines.yml` runs four stages:
-
-| Stage    | Branch               | Purpose                                        |
-|----------|----------------------|------------------------------------------------|
-| Test     | all branches and PRs | compile, format, unit/integration/e2e/gherkin  |
-| Security | all branches and PRs | `mix deps.audit` + `mix sobelow`               |
-| Coverage | all branches and PRs | `mix coveralls.html`; report saved as artifact |
-| Publish  | `master` push only   | `mix hex.publish --yes` with `HEX_API_KEY`     |
-
-#### 5 — What to commit
-
-- `bitbucket-pipelines.yml` — commit this file; it is already present.
-- Never commit `HEX_API_KEY` or any secret; use repository / workspace variables only.
 
 ---
 
