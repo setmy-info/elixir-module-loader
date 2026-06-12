@@ -431,12 +431,32 @@ Retiring warns users without removing the version (existing users are not broken
 
 ### CI auto-publish (GitHub Actions)
 
-Add a `HEX_API_KEY` secret to your repository (Settings → Secrets).
-Generate a CI-specific key (separate from your personal key):
+The publish job needs a `HEX_API_KEY` repository secret. If it is absent
+(the CI publish step fails with an authentication error or reports
+`HEX_API_KEY: NOT SET or empty`), add it as follows:
 
-```bash
-mix hex.user key generate --key-name github-ci
-```
+1. Generate a CI-specific key (separate from your personal key):
+
+   ```bash
+   mix hex.user key generate --key-name github-ci
+   ```
+
+   For an organization package, generate an organization key instead:
+
+   ```bash
+   mix hex.organization key generate setmy_info --key-name github-ci
+   ```
+
+2. Copy the key printed to the terminal — it is shown only once.
+3. On GitHub, open the repository page and go to
+   **Settings → Secrets and variables → Actions**.
+4. On the **Secrets** tab, click **New repository secret**.
+5. Set **Name** to `HEX_API_KEY`, paste the key into **Secret**,
+   and click **Add secret**.
+
+The workflow reads it via `${{ secrets.HEX_API_KEY }}`; no further
+configuration is needed. To replace a leaked or rotated key, repeat the
+steps and use **Update** on the existing secret.
 
 Add a publish job to `.github/workflows/ci.yml`:
 
