@@ -31,6 +31,7 @@ defmodule SetmyInfo.ElixirModuleLoader.CompilerTest do
       assert 10 == apply(SetmyInfo.ElixirModuleLoader.Test.TempAdder, :add, [3, 7])
     end
 
+    @tag capture_log: true
     test "returns error tuple for invalid Elixir source" do
       assert {:error, _} = Compiler.from_source("this is not valid elixir {{{")
     end
@@ -41,6 +42,44 @@ defmodule SetmyInfo.ElixirModuleLoader.CompilerTest do
       fixture = Path.expand("../../fixtures/sample_module.ex", __DIR__)
       assert {:ok, modules} = Compiler.from_file(fixture)
       assert length(modules) >= 1
+    end
+  end
+
+  describe "from_beam_binary/2" do
+    test "loads a module from an in-memory BEAM binary" do
+      {:ok, [{module, binary}]} = Compiler.from_source(@module_source)
+      :code.purge(module)
+      :code.delete(module)
+      :code.purge(module)
+
+      assert :ok == Compiler.from_beam_binary(module, binary)
+      assert 10 == apply(module, :add, [3, 7])
+    end
+
+    @tag capture_log: true
+    test "returns error for invalid binary" do
+      assert {:error, _} = Compiler.from_beam_binary(NonExistentMod, <<"not a beam">>)
+    end
+  end
+
+  describe "from_beam_file/1" do
+    test "loads a module from a .beam file on disk" do
+      {:ok, [{module, binary}]} = Compiler.from_source(@module_source)
+      beam_path = Path.join(System.tmp_dir!(), "#{module}.beam")
+      File.write!(beam_path, binary)
+      :code.purge(module)
+      :code.delete(module)
+      :code.purge(module)
+
+      on_exit(fn -> File.rm(beam_path) end)
+
+      assert {:ok, ^module} = Compiler.from_beam_file(beam_path)
+      assert 10 == apply(module, :add, [3, 7])
+    end
+
+    @tag capture_log: true
+    test "returns error for non-existent beam file" do
+      assert {:error, _} = Compiler.from_beam_file("/tmp/does_not_exist_ever.beam")
     end
   end
 

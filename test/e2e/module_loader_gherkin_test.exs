@@ -1,5 +1,3 @@
-Code.require_file("../support/module_loader_context.ex", __DIR__)
-
 defmodule SetmyInfo.ElixirModuleLoader.E2E.GherkinTest do
   use ExUnit.Case, async: false
 

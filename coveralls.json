@@ -1,6 +1,6 @@
 {
-  "output_dir": "_build/cover",
   "coverage_options": {
+    "output_dir": "_build/cover",
     "minimum_coverage": 0,
     "treat_no_relevant_lines_as_covered": true
   },

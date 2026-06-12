@@ -23,12 +23,17 @@ defmodule SetmyInfo.ElixirModuleLoader.Executor do
   @doc """
   Load the module, execute the function, then immediately release the module.
   The full load → execute → release lifecycle in a single call.
+
+  The execute result is always returned, even when a concurrent caller has
+  already released the key (the release is best-effort).
   """
   @spec run_and_release(<<_::128>>, atom(), [term()]) :: {:ok, term()} | {:error, term()}
   def run_and_release(<<_::128>> = key, function, args) do
-    with {:ok, _pid} <- Loader.load(key),
-         result <- Worker.execute(key, function, args),
-         :ok <- Loader.release(key) do
+    with {:ok, _pid} <- Loader.load(key) do
+      result = Worker.execute(key, function, args)
+      # Best-effort: a concurrent release may have won the race; the caller
+      # still gets the execute result, not the release error.
+      Loader.release(key)
       result
     end
   end

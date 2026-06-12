@@ -1,10 +1,18 @@
 defmodule SetmyInfo.ElixirModuleLoader.MixProject do
   use Mix.Project
 
+  @coveralls_commands [
+    :coveralls,
+    :"coveralls.detail",
+    :"coveralls.post",
+    :"coveralls.html",
+    :"coveralls.lcov"
+  ]
+
   def project do
     [
       app: :elixir_module_loader,
-      version: "1.0.0",
+      version: "1.1.0",
       elixir: "~> 1.17",
       name: "ElixirModuleLoader",
       description:
@@ -12,6 +20,7 @@ defmodule SetmyInfo.ElixirModuleLoader.MixProject do
       source_url: "https://github.com/setmy-info/elixir-module-loader",
       homepage_url: "https://github.com/setmy-info/elixir-module-loader",
       start_permanent: Mix.env() == :live,
+      elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       aliases: aliases(),
       package: package(),
@@ -34,29 +43,27 @@ defmodule SetmyInfo.ElixirModuleLoader.MixProject do
 
   def cli do
     [
-      preferred_envs: [
-        "test.unit": :test,
-        "test.integration": :test,
-        "test.e2e": :test,
-        "test.gherkin": :test,
-        "test.all": :test,
-        "test.mutation": :test,
-        "test.coverage": :test,
-        validate: :test,
-        coveralls: :test,
-        "coveralls.detail": :test,
-        "coveralls.post": :test,
-        "coveralls.html": :test,
-        "coveralls.lcov": :test
-      ]
+      preferred_envs:
+        [
+          "test.unit": :test,
+          "test.integration": :test,
+          "test.e2e": :test,
+          "test.gherkin": :test,
+          "test.all": :test,
+          "test.coverage": :test,
+          report: :test
+        ] ++ preferred_cli_env()
     ]
+  end
+
+  defp preferred_cli_env do
+    Enum.map(@coveralls_commands, &{&1, :test})
   end
 
   defp deps do
     [
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
-      {:excoveralls, "~> 0.18", only: :test},
-      {:muzak, "~> 1.0", only: :test},
+      {:ex_doc, "~> 0.34", runtime: false},
+      {:excoveralls, "~> 0.18", runtime: false},
       {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false},
       {:sobelow, "~> 0.13", only: [:dev, :test], runtime: false},
       {:white_bread, "4.4.0", only: [:test, :ci]},
@@ -74,6 +81,11 @@ defmodule SetmyInfo.ElixirModuleLoader.MixProject do
     ]
   end
 
+  defp elixirc_paths(env) when env in [:test, :ci],
+    do: ["lib", "test/support", "test/fixtures"]
+
+  defp elixirc_paths(_), do: ["lib"]
+
   defp aliases do
     [
       build: ["deps.get", "compile"],
@@ -84,7 +96,6 @@ defmodule SetmyInfo.ElixirModuleLoader.MixProject do
       "test.e2e": ["test test/e2e"],
       "test.gherkin": ["test test/e2e/module_loader_gherkin_test.exs"],
       "test.all": ["test"],
-      "test.mutation": ["muzak"],
       "test.coverage": ["coveralls.html"],
       audit: ["deps.audit"],
       security: ["sobelow --config"],

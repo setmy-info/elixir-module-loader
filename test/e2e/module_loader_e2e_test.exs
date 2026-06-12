@@ -67,6 +67,28 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderTest do
     assert SetmyInfo.ElixirModuleLoader.loaded?(key)
   end
 
+  test "reload/1 starts a fresh Worker and pid_for/1 tracks it", %{key: key} do
+    SetmyInfo.ElixirModuleLoader.compile_file(@fixture_path)
+    SetmyInfo.ElixirModuleLoader.register(key, SetmyInfo.ElixirModuleLoader.Support.SampleModule)
+
+    {:ok, pid1} = SetmyInfo.ElixirModuleLoader.load(key)
+    assert {:ok, ^pid1} = SetmyInfo.ElixirModuleLoader.pid_for(key)
+
+    {:ok, pid2} = SetmyInfo.ElixirModuleLoader.reload(key)
+    assert pid1 != pid2
+    assert {:ok, ^pid2} = SetmyInfo.ElixirModuleLoader.pid_for(key)
+  end
+
+  test "load_beam_binary/2 loads module from BEAM binary", %{key: _key} do
+    {:ok, [{module, binary}]} = SetmyInfo.ElixirModuleLoader.compile_file(@fixture_path)
+    :code.purge(module)
+    :code.delete(module)
+    :code.purge(module)
+
+    assert :ok == SetmyInfo.ElixirModuleLoader.load_beam_binary(module, binary)
+    assert function_exported?(module, :execute, 2)
+  end
+
   test "two distinct keys, two distinct modules loaded concurrently", %{key: key1} do
     key2 = SetmyInfo.ElixirModuleLoader.generate_key()
 

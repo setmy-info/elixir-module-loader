@@ -4,9 +4,10 @@ Dynamic Elixir module compilation, loading, 128-bit-keyed registry, and
 lifecycle management as a reusable OTP library.
 
 Compile Elixir source strings or `.ex` / `.beam` files at runtime, register
-the resulting modules under cryptographically-random 128-bit keys, load them
-into supervised Worker processes, execute their functions, and release
-them — all in a process-safe OTP supervision tree.
+the resulting modules under cryptographically-random 128-bit keys (as raw
+binaries **or** UUID strings), load them into supervised Worker processes,
+execute their functions, and release them — all in a process-safe OTP
+supervision tree.
 
 ## Installation
 
@@ -59,13 +60,56 @@ One-call shortcuts — no manual load/release needed:
 {:ok, result} = ElixirModuleLoader.run_and_release(key, :greet, ["World"])
 ```
 
-## Key type
+## Quick start (UUID)
 
-All public functions accept a 16-byte binary (`<<_::128>>`).
-Use `generate_key/0` to create a cryptographically-random key:
+Prefer a human-readable identifier? Every key-taking function also accepts a
+UUID string, and `register_file/2` compiles-or-loads a file and registers it
+in one call:
 
 ```elixir
-key = SetmyInfo.ElixirModuleLoader.generate_key()  # :crypto.strong_rand_bytes(16)
+alias SetmyInfo.ElixirModuleLoader
+
+# 1. Generate a UUID for the module
+uuid = ElixirModuleLoader.generate_uuid()
+#=> "8c7f2a3e-1b4d-4e6f-9a0b-3c5d7e9f1a2b"
+
+# 2. Compile a .ex file (or load a .beam file) and register under the UUID
+{:ok, _module} = ElixirModuleLoader.register_file(uuid, "plugins/my_plugin.ex")
+
+# 3. Request the module by UUID and run it
+{:ok, _pid}   = ElixirModuleLoader.load(uuid)
+{:ok, result} = ElixirModuleLoader.execute(uuid, :greet, ["World"])
+
+# 4. Release by UUID
+:ok = ElixirModuleLoader.release(uuid)
+```
+
+`register_file/2` picks the loader by extension: a path ending in `.beam` is
+loaded as a pre-compiled binary, anything else is compiled as Elixir source.
+
+## Key type
+
+All key-taking functions accept **either** form interchangeably:
+
+* a **UUID string** — `"550e8400-e29b-41d4-a716-446655440000"` (`generate_uuid/0`)
+* a **16-byte binary** — `<<_::128>>` (`generate_key/0`)
+
+```elixir
+key  = SetmyInfo.ElixirModuleLoader.generate_key()   # :crypto.strong_rand_bytes(16)
+uuid = SetmyInfo.ElixirModuleLoader.generate_uuid()  # random UUIDv4 string
+```
+
+A UUID is exactly 128 bits, so the two forms address the same registry entry —
+register under a UUID and look up with its binary form (or vice versa) and you
+reach the same module. Convert explicitly with the `SetmyInfo.ElixirModuleLoader.UUID`
+helper:
+
+```elixir
+alias SetmyInfo.ElixirModuleLoader.UUID
+
+key  = UUID.to_key!("550e8400-e29b-41d4-a716-446655440000")  # → <<_::128>>
+uuid = UUID.from_key(key)                                    # → "550e8400-..."
+UUID.uuid_string?(uuid)                                      # → true
 ```
 
 ## Implementing the Behaviour
@@ -127,7 +171,8 @@ ElixirModuleLoader.register(key, Math)
 
 ## API reference
 
-All functions live on `SetmyInfo.ElixirModuleLoader`.
+All functions live on `SetmyInfo.ElixirModuleLoader`. Every `key` parameter
+below accepts **either** a 16-byte binary or a UUID string.
 
 ### Compilation
 
@@ -142,12 +187,17 @@ All functions live on `SetmyInfo.ElixirModuleLoader`.
 
 | Function                    | Description                                                   |
 |-----------------------------|---------------------------------------------------------------|
-| `generate_key()`            | Generate a cryptographically-random 128-bit key               |
-| `register(key, module)`     | Register a module atom under a 128-bit key                    |
+| `generate_key()`            | Generate a cryptographically-random 128-bit binary key        |
+| `generate_uuid()`           | Generate a random version-4 UUID string                       |
+| `register(key, module)`     | Register a module atom under a key or UUID                    |
+| `register_file(key, path)`  | Compile (`.ex`) or load (`.beam`) a file and register it under a key or UUID |
 | `register_many(specs)`      | Register many `{key, module}` pairs at once                   |
 | `lookup(key)`               | Look up which module is registered under a key                |
 | `unregister(key)`           | Remove a key → module mapping (does not stop the Worker)      |
 | `registered?(key)`          | Check if a key is currently registered                        |
+
+The `SetmyInfo.ElixirModuleLoader.UUID` module provides the conversion
+helpers: `generate/0`, `to_key/1`, `to_key!/1`, `from_key/1`, `uuid_string?/1`.
 
 ### Lifecycle
 
@@ -163,7 +213,7 @@ All functions live on `SetmyInfo.ElixirModuleLoader`.
 
 | Function                          | Description                                                    |
 |-----------------------------------|----------------------------------------------------------------|
-| `execute(key, function, args)`    | Execute a function on the already-loaded Worker                |
+| `execute(key, function, args, timeout \\\\ 5000)` | Execute a function on the already-loaded Worker; `{:error, :timeout}` if it exceeds `timeout` ms |
 | `run(key, function, args)`        | Load (if needed), execute, leave Worker running                |
 | `run_and_release(key, function, args)` | Load, execute, release — full lifecycle in one call       |
 
@@ -212,6 +262,37 @@ The `:rest_for_one` strategy means:
 - DynamicSupervisor crash → Loader restarts and reconciles with surviving Workers
 - Loader crash → only Loader restarts; Workers survive, Loader reconciles from WorkerRegistry
 
+## Concurrency & safety guarantees
+
+| Operation                          | Guarantee                                                                                                   |
+|------------------------------------|-------------------------------------------------------------------------------------------------------------|
+| `compile/1`, `compile_file/1`      | Serialised through the dedicated CompileLock GenServer — the VM-global compiler flag is never toggled by two callers at once, its previous value is restored, and a slow compile never blocks registry writes |
+| `load_beam_file/1`, `load_beam_binary/2` | Safe to call concurrently — go straight to the VM code server, which is itself serialised               |
+| `register/2`, `register_file/2`, `unregister/1`, `register_many/1` | Writes serialised through the Registry GenServer; `register_many/1` validates every spec before inserting. UUID strings are converted to keys before dispatch |
+| `lookup/1`, `registered?/1`        | Lock-free O(1) ETS reads, safe for many concurrent readers                                                  |
+| `load/1`, `reload/1`, `release/1`  | Mutations serialised through the Loader GenServer; `load/1` is idempotent across concurrent callers          |
+| `loaded?/1`, `pid_for/1`           | Lock-free ETS reads; kept honest by Worker monitoring (see below)                                           |
+| `execute/3,4`                      | A plugin that raises returns `{:error, {:plugin_error, _}}`; one that exceeds the call timeout returns `{:error, :timeout}`; a Worker killed mid-call returns `{:error, :not_loaded}` — the caller never crashes |
+
+**Worker monitoring & self-healing.** The Loader monitors every Worker it
+starts. If a Worker dies outside of `release/1`, the Loader removes its stale
+tracking entry, so `loaded?/1` and `pid_for/1` stop reporting a dead PID. Workers
+are `restart: :temporary`, so a crashed Worker is not silently respawned under a
+new PID the Loader doesn't know about.
+
+> **Caveat — dead-PID window.** Between a Worker dying and the Loader
+> processing its `:DOWN` message there is a brief window where `loaded?/1`
+> returns `true` and `pid_for/1` returns a PID that is no longer alive.
+> `execute/3,4` tolerates this (it returns `{:error, :not_loaded}`), but code
+> using `pid_for/1` directly must be prepared for the PID to be dead.
+
+> **Caveat — `run_and_release/3` on the same key.** This shortcut assumes the
+> caller owns the key for the duration of the call. Two processes calling
+> `run_and_release/3` (or `release/1`) on the *same* key concurrently can race:
+> one may release the Worker out from under the other, which then sees
+> `{:error, :not_loaded}`. For shared keys, coordinate access or use distinct
+> keys per caller.
+
 ## Development commands
 
 ```bash
@@ -226,7 +307,6 @@ mix test.e2e           # e2e + Gherkin BDD tests
 mix test.gherkin       # Gherkin/Cucumber only
 mix test.all           # all tests
 mix test.coverage      # ExCoveralls HTML report → _build/cover/
-mix test.mutation      # Muzak mutation testing
 mix audit              # dependency vulnerability scan (mix_audit)
 mix security           # static security analysis (sobelow)
 mix docs               # ExDoc HTML → _build/doc/
