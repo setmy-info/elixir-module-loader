@@ -1,20 +1,18 @@
 defmodule SetmyInfo.ElixirModuleLoader.Integration.ConcurrentTest do
   @moduledoc """
-  Integration test: concurrent register, load, execute, and release from many processes.
-
-  Verifies that the GenServer-backed Registry and Loader are process-safe.
+  Integration test: concurrent register, load, call, and release from many
+  processes. Verifies that the GenServer-backed Registry and Loader are
+  process-safe.
   """
 
   use ExUnit.Case, async: false
 
-  alias SetmyInfo.ElixirModuleLoader.{Compiler, Loader, Registry, Worker}
+  alias SetmyInfo.ElixirModuleLoader, as: EML
+  alias SetmyInfo.ElixirModuleLoader.{Compiler, Loader, Registry}
 
   @source """
   defmodule SetmyInfo.ElixirModuleLoader.Integration.ConcurrentPlugin do
-    @behaviour SetmyInfo.ElixirModuleLoader.Behaviour
-    def name, do: :concurrent_plugin
-    def execute(:double, [n]), do: {:ok, n * 2}
-    def execute(f, _), do: {:error, {:undefined_function, f}}
+    def double(n), do: n * 2
   end
   """
 
@@ -23,7 +21,7 @@ defmodule SetmyInfo.ElixirModuleLoader.Integration.ConcurrentTest do
     :ok
   end
 
-  test "many processes can register and load distinct keys without races" do
+  test "many processes can register, load, call and release distinct keys without races" do
     n = 20
 
     tasks =
@@ -31,9 +29,9 @@ defmodule SetmyInfo.ElixirModuleLoader.Integration.ConcurrentTest do
         Task.async(fn ->
           key = :crypto.strong_rand_bytes(16)
           :ok = Registry.register(key, SetmyInfo.ElixirModuleLoader.Integration.ConcurrentPlugin)
-          {:ok, _pid} = Loader.load(key)
-          assert {:ok, i * 2} == Worker.execute(key, :double, [i])
-          :ok = Loader.release(key)
+          {:ok, module} = EML.load(key)
+          assert i * 2 == module.double(i)
+          :ok = EML.release(key)
           Registry.unregister(key)
           :done
         end)
@@ -52,49 +50,40 @@ defmodule SetmyInfo.ElixirModuleLoader.Integration.ConcurrentTest do
       Registry.unregister(key)
     end)
 
-    tasks = for _ <- 1..10, do: Task.async(fn -> Loader.load(key) end)
+    tasks = for _ <- 1..10, do: Task.async(fn -> EML.load(key) end)
     results = Task.await_many(tasks, 5_000)
 
-    pids = Enum.map(results, fn {:ok, pid} -> pid end)
-    unique_pids = Enum.uniq(pids)
-
-    assert length(unique_pids) == 1, "All concurrent loads must return the same Worker PID"
-    assert Process.alive?(hd(unique_pids))
+    modules = Enum.map(results, fn {:ok, module} -> module end)
+    assert [_one] = Enum.uniq(modules)
   end
 
-  test "hot swap: Worker stays alive, new code is picked up" do
+  test "hot swap: direct calls pick up new code without re-loading" do
     key = :crypto.strong_rand_bytes(16)
 
     v1 = """
     defmodule SetmyInfo.ElixirModuleLoader.Integration.HotPlugin do
-      @behaviour SetmyInfo.ElixirModuleLoader.Behaviour
-      def name, do: :hot_plugin
-      def execute(:value, []), do: {:ok, 1}
-      def execute(f, _), do: {:error, {:undefined_function, f}}
+      def value, do: 1
     end
     """
 
     v2 = """
     defmodule SetmyInfo.ElixirModuleLoader.Integration.HotPlugin do
-      @behaviour SetmyInfo.ElixirModuleLoader.Behaviour
-      def name, do: :hot_plugin
-      def execute(:value, []), do: {:ok, 99}
-      def execute(f, _), do: {:error, {:undefined_function, f}}
+      def value, do: 99
     end
     """
 
     {:ok, _} = Compiler.from_source(v1)
     :ok = Registry.register(key, SetmyInfo.ElixirModuleLoader.Integration.HotPlugin)
-    {:ok, pid} = Loader.load(key)
+    {:ok, module} = EML.load(key)
 
-    assert {:ok, 1} == Worker.execute(key, :value, [])
+    assert 1 == module.value()
 
     {:ok, _} = Compiler.from_source(v2)
 
-    assert Process.alive?(pid), "Worker must survive hot swap"
-    assert {:ok, 99} == Worker.execute(key, :value, [])
+    # Fully-qualified calls always hit the current code version.
+    assert 99 == module.value()
 
-    Loader.release(key)
+    EML.release(key)
     Registry.unregister(key)
   end
 end

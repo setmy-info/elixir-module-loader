@@ -3,12 +3,14 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderTest do
   End-to-end test exercising the full public API facade (`ElixirModuleLoader`).
 
   Uses the file-based fixture to verify compile-from-file, register, load,
-  execute, and release.
+  direct call, and release — no execute/run dispatch, all calls are the
+  caller's responsibility after `load/1` returns the module.
   """
 
   use ExUnit.Case, async: false
 
   @fixture_path Path.expand("../fixtures/sample_module.ex", __DIR__)
+  @module SetmyInfo.ElixirModuleLoader.Support.SampleModule
 
   setup do
     key = SetmyInfo.ElixirModuleLoader.generate_key()
@@ -27,66 +29,66 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderTest do
     assert byte_size(key) == 16
   end
 
-  test "full e2e: compile file → register → load → execute → release", %{key: key} do
+  test "full e2e: compile file → register → load → direct call → release", %{key: key} do
     assert {:ok, _modules} = SetmyInfo.ElixirModuleLoader.compile_file(@fixture_path)
 
-    :ok =
-      SetmyInfo.ElixirModuleLoader.register(
-        key,
-        SetmyInfo.ElixirModuleLoader.Support.SampleModule
-      )
-
+    :ok = SetmyInfo.ElixirModuleLoader.register(key, @module)
     assert SetmyInfo.ElixirModuleLoader.registered?(key)
 
-    {:ok, _pid} = SetmyInfo.ElixirModuleLoader.load(key)
+    {:ok, module} = SetmyInfo.ElixirModuleLoader.load(key)
     assert SetmyInfo.ElixirModuleLoader.loaded?(key)
 
-    assert {:ok, 10} == SetmyInfo.ElixirModuleLoader.execute(key, :add, [3, 7])
-    assert {:ok, 21} == SetmyInfo.ElixirModuleLoader.execute(key, :multiply, [3, 7])
-    assert {:ok, "hello"} == SetmyInfo.ElixirModuleLoader.execute(key, :echo, ["hello"])
+    assert 10 == module.add(3, 7)
+    assert 21 == module.multiply(3, 7)
+    assert "hello" == module.echo("hello")
 
     :ok = SetmyInfo.ElixirModuleLoader.release(key)
     refute SetmyInfo.ElixirModuleLoader.loaded?(key)
   end
 
-  test "run_and_release/3: compile → register → run → auto-release", %{key: key} do
+  test "load → call → release lifecycle", %{key: key} do
     SetmyInfo.ElixirModuleLoader.compile_file(@fixture_path)
-    SetmyInfo.ElixirModuleLoader.register(key, SetmyInfo.ElixirModuleLoader.Support.SampleModule)
+    SetmyInfo.ElixirModuleLoader.register(key, @module)
 
     refute SetmyInfo.ElixirModuleLoader.loaded?(key)
-    assert {:ok, 5} == SetmyInfo.ElixirModuleLoader.run_and_release(key, :add, [2, 3])
+    {:ok, module} = SetmyInfo.ElixirModuleLoader.load(key)
+    assert 5 == module.add(2, 3)
+    :ok = SetmyInfo.ElixirModuleLoader.release(key)
     refute SetmyInfo.ElixirModuleLoader.loaded?(key)
   end
 
-  test "run/3: loads and keeps module alive for repeated calls", %{key: key} do
+  test "load is idempotent — multiple calls return same module", %{key: key} do
     SetmyInfo.ElixirModuleLoader.compile_file(@fixture_path)
-    SetmyInfo.ElixirModuleLoader.register(key, SetmyInfo.ElixirModuleLoader.Support.SampleModule)
+    SetmyInfo.ElixirModuleLoader.register(key, @module)
 
-    assert {:ok, 5} == SetmyInfo.ElixirModuleLoader.run(key, :add, [2, 3])
-    assert {:ok, 6} == SetmyInfo.ElixirModuleLoader.run(key, :add, [2, 4])
+    {:ok, m1} = SetmyInfo.ElixirModuleLoader.load(key)
+    {:ok, m2} = SetmyInfo.ElixirModuleLoader.load(key)
+    assert m1 == m2
+    assert 5 == m1.add(2, 3)
+    assert 6 == m1.add(2, 4)
     assert SetmyInfo.ElixirModuleLoader.loaded?(key)
   end
 
-  test "reload/1 starts a fresh Worker and pid_for/1 tracks it", %{key: key} do
+  test "reload/1 returns the module and keeps it callable", %{key: key} do
     SetmyInfo.ElixirModuleLoader.compile_file(@fixture_path)
-    SetmyInfo.ElixirModuleLoader.register(key, SetmyInfo.ElixirModuleLoader.Support.SampleModule)
+    SetmyInfo.ElixirModuleLoader.register(key, @module)
 
-    {:ok, pid1} = SetmyInfo.ElixirModuleLoader.load(key)
-    assert {:ok, ^pid1} = SetmyInfo.ElixirModuleLoader.pid_for(key)
+    {:ok, module} = SetmyInfo.ElixirModuleLoader.load(key)
+    assert 5 == module.add(2, 3)
 
-    {:ok, pid2} = SetmyInfo.ElixirModuleLoader.reload(key)
-    assert pid1 != pid2
-    assert {:ok, ^pid2} = SetmyInfo.ElixirModuleLoader.pid_for(key)
+    {:ok, reloaded} = SetmyInfo.ElixirModuleLoader.reload(key)
+    assert reloaded == module
+    assert 5 == reloaded.add(2, 3)
   end
 
-  test "load_beam_binary/2 loads module from BEAM binary", %{key: _key} do
+  test "load_beam_binary/2 loads module from BEAM binary and makes it callable", %{key: _key} do
     {:ok, [{module, binary}]} = SetmyInfo.ElixirModuleLoader.compile_file(@fixture_path)
     :code.purge(module)
     :code.delete(module)
     :code.purge(module)
 
     assert :ok == SetmyInfo.ElixirModuleLoader.load_beam_binary(module, binary)
-    assert function_exported?(module, :execute, 2)
+    assert 5 == module.add(2, 3)
   end
 
   test "two distinct keys, two distinct modules loaded concurrently", %{key: key1} do
@@ -94,26 +96,20 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderTest do
 
     source_a = """
     defmodule SetmyInfo.ElixirModuleLoader.E2E.PluginA do
-      @behaviour SetmyInfo.ElixirModuleLoader.Behaviour
-      def name, do: :plugin_a
-      def execute(:value, []), do: {:ok, :a}
-      def execute(f, _), do: {:error, {:undefined_function, f}}
+      def value, do: :a
     end
     """
 
     source_b = """
     defmodule SetmyInfo.ElixirModuleLoader.E2E.PluginB do
-      @behaviour SetmyInfo.ElixirModuleLoader.Behaviour
-      def name, do: :plugin_b
-      def execute(:value, []), do: {:ok, :b}
-      def execute(f, _), do: {:error, {:undefined_function, f}}
+      def value, do: :b
     end
     """
 
-    SetmyInfo.ElixirModuleLoader.compile(source_a)
-    SetmyInfo.ElixirModuleLoader.compile(source_b)
-    SetmyInfo.ElixirModuleLoader.register(key1, SetmyInfo.ElixirModuleLoader.E2E.PluginA)
-    SetmyInfo.ElixirModuleLoader.register(key2, SetmyInfo.ElixirModuleLoader.E2E.PluginB)
+    {:ok, [{mod_a, _}]} = SetmyInfo.ElixirModuleLoader.compile(source_a)
+    {:ok, [{mod_b, _}]} = SetmyInfo.ElixirModuleLoader.compile(source_b)
+    SetmyInfo.ElixirModuleLoader.register(key1, mod_a)
+    SetmyInfo.ElixirModuleLoader.register(key2, mod_b)
 
     on_exit(fn ->
       if SetmyInfo.ElixirModuleLoader.loaded?(key2),
@@ -122,7 +118,13 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderTest do
       SetmyInfo.ElixirModuleLoader.unregister(key2)
     end)
 
-    assert {:ok, :a} == SetmyInfo.ElixirModuleLoader.run_and_release(key1, :value, [])
-    assert {:ok, :b} == SetmyInfo.ElixirModuleLoader.run_and_release(key2, :value, [])
+    {:ok, m1} = SetmyInfo.ElixirModuleLoader.load(key1)
+    {:ok, m2} = SetmyInfo.ElixirModuleLoader.load(key2)
+
+    assert :a == m1.value()
+    assert :b == m2.value()
+
+    SetmyInfo.ElixirModuleLoader.release(key1)
+    SetmyInfo.ElixirModuleLoader.release(key2)
   end
 end

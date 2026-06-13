@@ -1,7 +1,7 @@
 defmodule SetmyInfo.ElixirModuleLoader.FacadeTest do
   @moduledoc """
   Facade-level tests for the dual key/UUID surface: register_many with UUIDs,
-  register_file from a .beam file, and execute/4 timeout.
+  register_file from a .beam file, and dynamic discovery via functions/1.
   """
 
   use ExUnit.Case, async: false
@@ -56,14 +56,11 @@ defmodule SetmyInfo.ElixirModuleLoader.FacadeTest do
   describe "register_file/2 from a .beam file" do
     @source """
     defmodule SetmyInfo.ElixirModuleLoader.Test.BeamFixture do
-      @behaviour SetmyInfo.ElixirModuleLoader.Behaviour
-      def name, do: :beam_fixture
-      def execute(:ping, []), do: {:ok, :pong}
-      def execute(f, _), do: {:error, {:undefined_function, f}}
+      def ping, do: :pong
     end
     """
 
-    test "compiles to a .beam on disk, then registers and runs it by UUID" do
+    test "compiles to a .beam on disk, then registers and calls it by UUID" do
       {:ok, [{module, binary}]} = ML.compile(@source)
       beam_path = Path.join(System.tmp_dir!(), "#{module}.beam")
       File.write!(beam_path, binary)
@@ -79,32 +76,31 @@ defmodule SetmyInfo.ElixirModuleLoader.FacadeTest do
       end)
 
       assert {:ok, ^module} = ML.register_file(uuid, beam_path)
-      assert {:ok, :pong} == ML.run_and_release(uuid, :ping, [])
+      {:ok, loaded} = ML.load(uuid)
+      assert :pong == loaded.ping()
     end
   end
 
-  describe "execute/4 timeout via the facade" do
-    test "a slow plugin returns {:error, :timeout} without crashing the caller" do
-      source = """
-      defmodule SetmyInfo.ElixirModuleLoader.Test.FacadeSlowPlugin do
-        @behaviour SetmyInfo.ElixirModuleLoader.Behaviour
-        def name, do: :facade_slow
-        def execute(:hang, []), do: (Process.sleep(500); {:ok, :late})
-        def execute(f, _), do: {:error, {:undefined_function, f}}
-      end
-      """
-
+  describe "functions/1 — dynamic discovery" do
+    test "lists the exports of an unknown loaded module" do
       uuid = ML.generate_uuid()
-      {:ok, _module} = ML.compile(source)
-      :ok = ML.register(uuid, SetmyInfo.ElixirModuleLoader.Test.FacadeSlowPlugin)
-      {:ok, _pid} = ML.load(uuid)
+
+      {:ok, _} =
+        ML.register_source(uuid, """
+        defmodule SetmyInfo.ElixirModuleLoader.Test.DiscoverFixture do
+          def alpha(x), do: x
+          def beta(x, y), do: {x, y}
+        end
+        """)
 
       on_exit(fn ->
         if ML.loaded?(uuid), do: ML.release(uuid)
         ML.unregister(uuid)
       end)
 
-      assert {:error, :timeout} = ML.execute(uuid, :hang, [], 100)
+      {:ok, exports} = ML.functions(uuid)
+      assert {:alpha, 1} in exports
+      assert {:beta, 2} in exports
     end
   end
 

@@ -3,14 +3,13 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderContext do
 
   import ExUnit.Assertions
 
+  alias SetmyInfo.ElixirModuleLoader, as: EML
   alias WhiteBread.Context.StepFunction
 
+  # A plain module — the library imposes no interface on loadable code.
   @source """
   defmodule SetmyInfo.ElixirModuleLoader.BDD.AddPlugin do
-    @behaviour SetmyInfo.ElixirModuleLoader.Behaviour
-    def name, do: :bdd_add_plugin
-    def execute(:add, [a, b]), do: {:ok, a + b}
-    def execute(f, _), do: {:error, {:undefined_function, f}}
+    def add(a, b), do: a + b
   end
   """
 
@@ -49,44 +48,40 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderContext do
   def get_scenario_timeout(_feature, _scenario), do: 30_000
 
   def step_module_loader_running(state, _extra) do
-    {:ok, _} = SetmyInfo.ElixirModuleLoader.compile(@source)
-    key = SetmyInfo.ElixirModuleLoader.generate_key()
-    :ok = SetmyInfo.ElixirModuleLoader.register(key, SetmyInfo.ElixirModuleLoader.BDD.AddPlugin)
-    {:ok, Map.merge(state, %{key: key, result: nil})}
+    key = EML.generate_key()
+    {:ok, _module} = EML.register_source(key, @source)
+    {:ok, Map.merge(state, %{key: key, module: nil, result: nil})}
   end
 
   def step_load_module(state, _extra) do
-    {:ok, _pid} = SetmyInfo.ElixirModuleLoader.load(state.key)
-    {:ok, state}
+    # Loading hands back the module itself — the caller owns the calls.
+    {:ok, module} = EML.load(state.key)
+    {:ok, %{state | module: module}}
   end
 
   def step_execute_add(state, %{a: a, b: b}) do
-    result =
-      SetmyInfo.ElixirModuleLoader.execute(state.key, :add, [
-        String.to_integer(a),
-        String.to_integer(b)
-      ])
-
+    # Direct, dynamic invocation: the function name is data at runtime.
+    result = apply(state.module, :add, [String.to_integer(a), String.to_integer(b)])
     {:ok, Map.put(state, :result, result)}
   end
 
   def step_result_should_be(state, %{expected: expected}) do
-    assert {:ok, String.to_integer(expected)} == state.result
+    assert String.to_integer(expected) == state.result
     {:ok, state}
   end
 
   def step_module_should_be_loaded(state, _extra) do
-    assert SetmyInfo.ElixirModuleLoader.loaded?(state.key)
+    assert EML.loaded?(state.key)
     {:ok, state}
   end
 
   def step_release_module(state, _extra) do
-    :ok = SetmyInfo.ElixirModuleLoader.release(state.key)
+    :ok = EML.release(state.key)
     {:ok, state}
   end
 
   def step_module_should_not_be_loaded(state, _extra) do
-    refute SetmyInfo.ElixirModuleLoader.loaded?(state.key)
+    refute EML.loaded?(state.key)
     {:ok, state}
   end
 end

@@ -46,7 +46,8 @@ key = ElixirModuleLoader.generate_key()
 # 4. Execute a function
 {:ok, "Hello, World!"} = ElixirModuleLoader.execute(key, :greet, ["World"])
 
-# 5. Release (terminates the Worker, frees resources)
+# 5. Release (terminates the Worker; for file/source-registered modules the
+#    compiled code is also purged from the VM — see "Memory management")
 :ok = ElixirModuleLoader.release(key)
 ```
 
@@ -112,7 +113,30 @@ uuid = UUID.from_key(key)                                    # → "550e8400-...
 UUID.uuid_string?(uuid)                                      # → true
 ```
 
-## Implementing the Behaviour
+## Loadable code — no interface required
+
+Any Elixir module can be loaded and executed; nothing has to be implemented:
+
+```elixir
+{:ok, _} = ElixirModuleLoader.compile("""
+  defmodule FreeForm do
+    def shout(s), do: String.upcase(s)
+  end
+""")
+:ok = ElixirModuleLoader.register(key, FreeForm)
+{:ok, _} = ElixirModuleLoader.load(key)
+{:ok, "HI"} = ElixirModuleLoader.execute(key, :shout, ["hi"])
+```
+
+For modules **without** the Behaviour, `execute/3,4` applies the named
+function directly and wraps the raw result as `{:ok, result}`. Crashes are
+isolated as `{:error, {:plugin_error, _}}`, timeouts apply as usual.
+
+### The Behaviour (optional)
+
+Implementing `SetmyInfo.ElixirModuleLoader.Behaviour` gives a module full
+control of its dispatch — pattern-matched function routing and its own error
+values, with no automatic wrapping:
 
 ```elixir
 defmodule MyPlugin do
@@ -126,8 +150,6 @@ defmodule MyPlugin do
   def execute(f, _), do: {:error, {:undefined_function, f}}
 end
 ```
-
-The behaviour requires two callbacks:
 
 | Callback          | Signature                                    | Description                          |
 |-------------------|----------------------------------------------|--------------------------------------|
@@ -189,12 +211,17 @@ below accepts **either** a 16-byte binary or a UUID string.
 |-----------------------------|---------------------------------------------------------------|
 | `generate_key()`            | Generate a cryptographically-random 128-bit binary key        |
 | `generate_uuid()`           | Generate a random version-4 UUID string                       |
-| `register(key, module)`     | Register a module atom under a key or UUID                    |
-| `register_file(key, path)`  | Compile (`.ex`) or load (`.beam`) a file and register it under a key or UUID |
+| `register(key, module)`     | Register a module atom under a key or UUID (code is externally managed — never purged) |
+| `register_file(key, path)`  | Compile (`.ex`) or load (`.beam`) a file and register it under a key or UUID; the path is remembered for code restore |
+| `register_source(key, source)` | Compile a source string and register the module; the BEAM binary is kept for code restore |
+| `register_function(key, {m, f, a}, opts)` | Register a single function under its own key; `pure: true` enables memoised caller-side execution |
+| `register_composite(key, ast)` | Register a composition of other keys as a new function (see below) |
 | `register_many(specs)`      | Register many `{key, module}` pairs at once                   |
 | `lookup(key)`               | Look up which module is registered under a key                |
 | `unregister(key)`           | Remove a key → module mapping (does not stop the Worker)      |
 | `registered?(key)`          | Check if a key is currently registered                        |
+| `list_registered()`         | All registered `{key, module}` pairs                          |
+| `count()`                   | Number of registered keys                                     |
 
 The `SetmyInfo.ElixirModuleLoader.UUID` module provides the conversion
 helpers: `generate/0`, `to_key/1`, `to_key!/1`, `from_key/1`, `uuid_string?/1`.
@@ -203,11 +230,13 @@ helpers: `generate/0`, `to_key/1`, `to_key!/1`, `from_key/1`, `uuid_string?/1`.
 
 | Function          | Description                                                          |
 |-------------------|----------------------------------------------------------------------|
-| `load(key)`       | Start a supervised Worker for the key; returns existing PID if already loaded |
-| `reload(key)`     | Terminate any existing Worker and start a fresh one                  |
-| `release(key)`    | Terminate the Worker and free resources                              |
+| `load(key, opts \\\\ [])` | Start a supervised Worker; restores purged code first; `idle_timeout:` ms auto-stops an inactive Worker |
+| `reload(key)`     | Terminate any existing Worker and start a fresh one (no code purge)  |
+| `release(key)`    | Terminate the Worker **and purge library-managed code** when no other loaded key uses the module |
 | `loaded?(key)`    | Check if a Worker is currently running for the key                   |
 | `pid_for(key)`    | Return the Worker PID for a key, or `{:error, :not_loaded}`          |
+| `list_loaded()`   | All currently loaded keys                                            |
+| `stats(key)`      | `{:ok, %{call_count, loaded_at, last_used_at}}` — for external usage trackers |
 
 ### Execution
 
@@ -216,6 +245,8 @@ helpers: `generate/0`, `to_key/1`, `to_key!/1`, `from_key/1`, `uuid_string?/1`.
 | `execute(key, function, args, timeout \\\\ 5000)` | Execute a function on the already-loaded Worker; `{:error, :timeout}` if it exceeds `timeout` ms |
 | `run(key, function, args)`        | Load (if needed), execute, leave Worker running                |
 | `run_and_release(key, function, args)` | Load, execute, release — full lifecycle in one call       |
+| `fun(key)`                        | Capture a function-target or composite key as a first-class closure of its registered arity |
+| `fun(key, function, arity \\\\ 1)`| Capture a module function as a first-class closure             |
 
 ## Bulk registration
 
@@ -244,6 +275,106 @@ To also reset Worker state (call count, etc.), use `reload/1`:
 ```elixir
 {:ok, _new_pid} = SetmyInfo.ElixirModuleLoader.reload(key)
 ```
+
+## Memory management
+
+Built for a huge catalog (up to 10⁶ modules) cycling through a small working
+set inside a never-restarting VM: releasing frees memory, loading brings
+modules back.
+
+* `release/1` terminates the Worker process **and**, for library-managed
+  code, deletes + soft-purges the module's compiled code from the VM.
+* Code is *library-managed* when the registry knows how to restore it:
+  registered via `register_file/2` (`.beam` path / `.ex` recompile) or
+  `register_source/2` (kept BEAM binary). Plain `register/2` entries are
+  never purged — the library will not purge what it cannot restore.
+* The purge is **reference-counted**: if another loaded key uses the same
+  module, the code stays until the last user releases.
+* A later `load/1` transparently restores purged code from the registered
+  source. The key stays addressable the whole time.
+
+```elixir
+{:ok, mod} = ElixirModuleLoader.register_source(uuid, ai_generated_source)
+{:ok, _}   = ElixirModuleLoader.load(uuid)
+{:ok, _}   = ElixirModuleLoader.execute(uuid, :transform, [data])
+:ok        = ElixirModuleLoader.release(uuid)   # process AND code memory freed
+{:ok, _}   = ElixirModuleLoader.load(uuid)      # code restored automatically
+```
+
+Note: module-name **atoms** are never reclaimed by the VM. The same module
+always reuses its atom, so reload churn does not grow the atom table, but a
+catalog with more than ~1M *distinct* module names per VM lifetime needs the
+`+t` emulator flag raised (see VALIDATION.md).
+
+## Loadable functions & composition
+
+Keys can address single **functions** and **compositions**, not just
+modules — the functional-programming toolbox works on loaded code:
+
+```elixir
+alias SetmyInfo.ElixirModuleLoader
+
+# A single function as a catalog entry (pure ⇒ memoised, caller-side, parallel-safe)
+sq = ElixirModuleLoader.generate_uuid()
+:ok = ElixirModuleLoader.register_function(sq, {MyMath, :square, 1}, pure: true)
+{:ok, 9} = ElixirModuleLoader.execute(sq, :call, [3])
+
+# First-class capture — use with Enum/Stream/Task or pass to other loaded code
+square = ElixirModuleLoader.fun(sq)
+Enum.map([1, 2, 3], square)   #=> [{:ok, 1}, {:ok, 4}, {:ok, 9}]
+
+# Higher-order: pass a loaded function to another loaded function by key
+{:ok, _} = ElixirModuleLoader.execute(mapper, :map_with, [{:eml_fun, sq}, [1, 2]])
+
+# Composition as data, registered under its own key — a new tracked function
+ast = {:pipe, [{:ref, trim_uuid}, {:ref, clean_uuid, :remove_bad}, {:ref, up_uuid}]}
+:ok = ElixirModuleLoader.register_composite(pipeline_uuid, ast)
+{:ok, _} = ElixirModuleLoader.load(pipeline_uuid)
+{:ok, "HELLO WORLD !!!"} =
+  ElixirModuleLoader.execute(pipeline_uuid, :call, ["   Hello Bad World !!!   "])
+```
+
+Composite nodes: `{:ref, key}`, `{:ref, key, function}`,
+`{:partial, key, function, bound_args}` (currying), and `{:pipe, [stages]}`
+(railway composition — the first `{:error, _}` short-circuits). Ad-hoc
+closures without registration live in `SetmyInfo.ElixirModuleLoader.Fn`:
+`partial/3`, `pipe/1`.
+
+## Use-case examples
+
+Short, runnable examples for common usage patterns live in
+[`test/integration/use_case_test.exs`](test/integration/use_case_test.exs),
+[`test/integration/functions_test.exs`](test/integration/functions_test.exs)
+and
+[`test/integration/memory_lifecycle_test.exs`](test/integration/memory_lifecycle_test.exs)
+(run with `mix test.integration`):
+
+* **Compile on demand** — a UUID-named `.ex` file is compiled and registered
+  under its UUID only when no compiled artifact exists yet
+  (`register_file/2` handles both `.ex` and `.beam`).
+* **Function composition** — `result = f(g(data))` where `f` and `g` come
+  from two separately compiled and loaded modules; pipelines both as
+  closures and as registered composite keys.
+* **Currying / partial application** — `Fn.partial/3` and `{:partial, ...}`
+  composite nodes.
+* **Higher-order functions** — passing a loaded function to another loaded
+  function with `{:eml_fun, key}` arguments.
+* **Map data transformation** — loose map-shaped data flowing through a
+  dynamically compiled module.
+* **Interface-free modules** — loading and executing a module that
+  implements no Behaviour (direct apply dispatch).
+* **Memory lifecycle** — release purges code, reference counting across
+  keys, automatic restore on the next load, idle timeout, worker stats.
+
+See [VALIDATION.md](VALIDATION.md) for the full validation of the API
+against these use cases, including known restrictions (code unloading at
+scale, atom table growth, serialised compilation), their mitigations, and
+prioritised improvement notes describing what to refactor — and how — to
+lift each restriction (apply-based dispatch, true `unload/1`, BEAM caching,
+idle auto-release, composition helpers), and a functional-programming
+refactoring plan for treating loadable modules as loadable *functions*
+(first-class function values, composition-as-data, currying, purity-aware
+memoisation and parallel execution).
 
 ## Supervision tree
 

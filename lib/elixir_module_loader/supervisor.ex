@@ -3,15 +3,16 @@ defmodule SetmyInfo.ElixirModuleLoader.Supervisor do
   Root supervisor for SetmyInfo.ElixirModuleLoader.
 
   Owns:
-  - `SetmyInfo.ElixirModuleLoader.Registry` (GenServer) — 128-bit key → module atom, ETS-backed
-  - `SetmyInfo.ElixirModuleLoader.DynamicSupervisor` — starts/stops Worker processes on demand
-  - `SetmyInfo.ElixirModuleLoader.Loader` (GenServer) — tracks loaded modules in ETS
+  - `SetmyInfo.ElixirModuleLoader.Registry` (GenServer) — 128-bit key → module/meta, ETS-backed
+  - `SetmyInfo.ElixirModuleLoader.Loader` (GenServer) — loaded working set + code purge/restore
   - `SetmyInfo.ElixirModuleLoader.CompileLock` (GenServer) — serialises runtime compilation
 
+  The library starts no per-module processes: loaded code is called directly
+  by the library user, and any processes the loaded code starts are its own.
+
   Restart strategy is `:rest_for_one`:
-  - Registry crash → DynamicSupervisor + Loader + CompileLock restart (Workers terminated, ETS rebuilt)
-  - DynamicSupervisor crash → Loader + CompileLock restart; Loader reconciles with WorkerRegistry
-  - Loader crash → Loader + CompileLock restart; Workers survive, Loader reconciles
+  - Registry crash → Loader + CompileLock restart (ETS tables rebuilt)
+  - Loader crash → Loader + CompileLock restart (working set re-tracked by user)
   - CompileLock crash → only CompileLock restarts (it is stateless)
   """
 
@@ -25,8 +26,6 @@ defmodule SetmyInfo.ElixirModuleLoader.Supervisor do
   def init(_init_arg) do
     children = [
       SetmyInfo.ElixirModuleLoader.Registry,
-      {DynamicSupervisor,
-       name: SetmyInfo.ElixirModuleLoader.DynamicSupervisor, strategy: :one_for_one},
       SetmyInfo.ElixirModuleLoader.Loader,
       SetmyInfo.ElixirModuleLoader.CompileLock
     ]

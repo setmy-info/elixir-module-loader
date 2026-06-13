@@ -1,56 +1,91 @@
 defmodule SetmyInfo.ElixirModuleLoader do
   @moduledoc """
-  Public facade for dynamic Elixir module compilation, loading, and lifecycle management.
+  Public facade for dynamic Elixir module compilation, loading, and memory
+  lifecycle management.
 
-  Modules are registered and tracked under 128-bit keys. Every function that
-  takes a key accepts it in either of two interchangeable forms:
+  The library manages a catalog of dynamically loadable code addressed by
+  128-bit keys: compile it, register it, load it, discover its functions,
+  and release it (freeing code memory). **Calling the code is the library
+  user's business** — `load/1` returns the module itself, and there is no
+  dispatch layer, no required interface, no wrapping of results:
+
+      {:ok, module} = SetmyInfo.ElixirModuleLoader.load(key)
+      module.anything(args)            # direct call
+      apply(module, fun_atom, args)    # dynamic call with runtime names
+
+  Every key-taking function accepts either of two interchangeable forms:
 
   * a **UUID string** — `"550e8400-e29b-41d4-a716-446655440000"` (see `generate_uuid/0`)
   * a **16-byte binary** — `<<_::128>>` (see `generate_key/0`)
 
-  A UUID is exactly 128 bits, so both forms address the same registry entry:
-  registering under a UUID and looking up with its binary form (or vice versa)
-  refer to the same module. Use `SetmyInfo.ElixirModuleLoader.UUID` to convert
-  between the two explicitly.
+  ## What a key can address
+
+  * **A module** — `register/2`, `register_file/2`, `register_source/2`.
+    Any module; no interface required.
+  * **A single function** — `register_function/3` with a `{module, fun, arity}`;
+    capture it as a first-class closure with `fun/1`.
+  * **A composition** — `register_composite/2` with a data AST referencing
+    other keys (see `SetmyInfo.ElixirModuleLoader.Composite`); the composed
+    function is a catalog entry like any other.
+
+  ## Discovering functions at runtime
+
+  Loadable code is often not known to the caller (AI-generated, catalog
+  modules). `functions/1` lists what a key exports; `fun/3` captures any of
+  them as a closure without hard-coding module names:
+
+      {:ok, exports} = SetmyInfo.ElixirModuleLoader.functions(key)
+      #=> {:ok, [add: 2, multiply: 2]}
+      add = SetmyInfo.ElixirModuleLoader.fun(key, :add, 2)
+      add.(2, 3)  #=> 5
+
+  ## Memory lifecycle
+
+  `release/1` removes the key from the loaded working set **and frees the
+  module's code**: when the code is library-managed (registered via
+  `register_file/2` or `register_source/2`) and no other loaded key uses the
+  same module, the code is deleted and soft-purged from the VM. The registry
+  remembers how to restore it (`.beam` file, `.ex` source, or in-memory BEAM
+  binary), so a later `load/1` brings it back transparently. Modules
+  registered with plain `register/2` are never purged — the library does not
+  purge what it cannot restore.
 
   ## Invalid keys
 
-  Every single-key function (`register/2`, `load/1`, `release/1`, `loaded?/1`,
-  `lookup/1`, …) raises `ArgumentError` when given a binary that is neither a
-  16-byte key nor a well-formed UUID string — an invalid key is treated as a
-  caller bug, not a runtime error tuple. The only exception is `register_many/1`,
-  which validates the whole batch and returns `{:error, :invalid_spec}` instead
-  of raising.
+  Every single-key function raises `ArgumentError` when given a binary that
+  is neither a 16-byte key nor a well-formed UUID string — an invalid key is
+  treated as a caller bug, not a runtime error tuple. The only exception is
+  `register_many/1`, which validates the whole batch and returns
+  `{:error, :invalid_spec}` instead of raising.
 
-  ## Typical workflow (UUID)
+  ## Typical workflow
 
       # 1. Generate a UUID for the module
       uuid = SetmyInfo.ElixirModuleLoader.generate_uuid()
 
-      # 2. Compile a .ex file (or load a .beam file) and register under the UUID
-      {:ok, _module} =
-        SetmyInfo.ElixirModuleLoader.register_file(uuid, "plugins/my_plugin.ex")
+      # 2. Compile a .ex file (or load a .beam) and register — one call,
+      #    the module comes back immediately
+      {:ok, module} = SetmyInfo.ElixirModuleLoader.register_file(uuid, "plugins/my_plugin.ex")
 
-      # 3. Load (starts a supervised Worker process)
-      {:ok, _pid} = SetmyInfo.ElixirModuleLoader.load(uuid)
+      # 3. Use it directly — the user knows (or discovers) the functions
+      result = module.transform(data)
 
-      # 4. Execute a function on the loaded module
-      {:ok, result} = SetmyInfo.ElixirModuleLoader.execute(uuid, :my_function, [arg1])
+      # 4. Later, by key: load (restores code if purged) and call dynamically
+      {:ok, module} = SetmyInfo.ElixirModuleLoader.load(uuid)
+      result = apply(module, :transform, [data])
 
-      # 5. Release (terminates the Worker, frees resources)
+      # 5. Release — frees the working-set slot AND the code memory
       :ok = SetmyInfo.ElixirModuleLoader.release(uuid)
-
-  ## Typical workflow (128-bit key)
-
-      {:ok, _} = SetmyInfo.ElixirModuleLoader.compile(source_code)
-      key = SetmyInfo.ElixirModuleLoader.generate_key()
-      :ok = SetmyInfo.ElixirModuleLoader.register(key, MyDynamicModule)
-      {:ok, _pid} = SetmyInfo.ElixirModuleLoader.load(key)
-      {:ok, result} = SetmyInfo.ElixirModuleLoader.execute(key, :my_function, [arg1])
-      :ok = SetmyInfo.ElixirModuleLoader.release(key)
   """
 
-  alias SetmyInfo.ElixirModuleLoader.{Compiler, Executor, Loader, Registry, UUID, Worker}
+  alias SetmyInfo.ElixirModuleLoader.{
+    Compiler,
+    Composite,
+    Fn,
+    Loader,
+    Registry,
+    UUID
+  }
 
   @typedoc "A 16-byte binary module key."
   @type key :: <<_::128>>
@@ -60,8 +95,6 @@ defmodule SetmyInfo.ElixirModuleLoader do
 
   @typedoc "Either accepted key form — a 16-byte binary or a UUID string."
   @type key_or_uuid :: key() | uuid()
-
-  @default_timeout 5_000
 
   @doc "Generate a cryptographically-random 128-bit binary key."
   @spec generate_key() :: key()
@@ -89,9 +122,15 @@ defmodule SetmyInfo.ElixirModuleLoader do
   @spec load_beam_binary(module(), binary()) :: :ok | {:error, term()}
   defdelegate load_beam_binary(module_name, binary), to: Compiler, as: :from_beam_binary
 
-  # ── Registry ─────────────────────────────────────────────────────────────────
+  # ── Registration ─────────────────────────────────────────────────────────────
 
-  @doc "Register a module atom under a UUID string or 128-bit key."
+  @doc """
+  Register a module atom under a UUID string or 128-bit key.
+
+  The module's code is treated as externally managed: `release/1` will not
+  purge it. Use `register_file/2` or `register_source/2` when the library
+  should also manage (and free) the code memory.
+  """
   @spec register(key_or_uuid(), module()) :: :ok
   def register(key_or_uuid, module_name),
     do: Registry.register(normalize(key_or_uuid), module_name)
@@ -101,8 +140,13 @@ defmodule SetmyInfo.ElixirModuleLoader do
   under `key_or_uuid` in a single call.
 
   A file ending in `.beam` is loaded as a pre-compiled binary; any other
-  extension is compiled as Elixir source. Returns `{:ok, module}` or
-  `{:error, reason}`.
+  extension is compiled as Elixir source. Returns `{:ok, module}` — the
+  module is immediately usable, no further registry call needed — or
+  `{:error, reason}`. The same module remains requestable later by its key.
+
+  The path is remembered as the module's code source: after `release/1`
+  purges the code, the next `load/1` restores it from the `.beam` file or by
+  recompiling the `.ex` file.
 
   > #### Multi-module source files {: .info}
   >
@@ -116,15 +160,75 @@ defmodule SetmyInfo.ElixirModuleLoader do
   def register_file(key_or_uuid, path) when is_binary(path) do
     key = normalize(key_or_uuid)
 
-    with {:ok, module} <- compile_or_load(path) do
-      :ok = Registry.register(key, module)
+    if String.ends_with?(path, ".beam") do
+      with {:ok, module} <- load_beam_file(path) do
+        :ok = Registry.register(key, module, %{beam_source: {:file, path}})
+        {:ok, module}
+      end
+    else
+      with {:ok, [{module, _beam} | _]} <- compile_file(path) do
+        :ok = Registry.register(key, module, %{beam_source: {:ex_file, path}})
+        {:ok, module}
+      end
+    end
+  end
+
+  @doc """
+  Compile an Elixir source string and register the (first) resulting module
+  under `key_or_uuid` in a single call — the AI-generated-code path.
+
+  Returns `{:ok, module}`; the module is immediately usable. The compiled
+  BEAM binary is kept in the registry entry so the code can be purged on
+  `release/1` and restored on the next `load/1` without any source file.
+  """
+  @spec register_source(key_or_uuid(), String.t()) :: {:ok, module()} | {:error, term()}
+  def register_source(key_or_uuid, source) when is_binary(source) do
+    key = normalize(key_or_uuid)
+
+    with {:ok, [{module, beam} | _]} <- compile(source) do
+      :ok = Registry.register(key, module, %{beam_source: {:binary, beam}})
       {:ok, module}
     end
   end
 
-  @doc "Look up which module atom is registered under a UUID string or key."
-  @spec lookup(key_or_uuid()) :: {:ok, module()} | {:error, :not_found}
-  def lookup(key_or_uuid), do: Registry.lookup(normalize(key_or_uuid))
+  @doc """
+  Register a single function `{module, function, arity}` under its own key.
+
+  The function becomes an addressable catalog entry; capture it as a
+  first-class closure with `fun/1`.
+
+  Options:
+
+  * `:pure` — declare the function side-effect free (default `false`). Calls
+    through `fun/1` (and composite refs) are then memoised per `{key, args}`.
+  """
+  @spec register_function(key_or_uuid(), {module(), atom(), non_neg_integer()}, keyword()) :: :ok
+  def register_function(key_or_uuid, {m, f, a}, opts \\ [])
+      when is_atom(m) and is_atom(f) and is_integer(a) and a >= 0 do
+    Registry.register(normalize(key_or_uuid), m, %{
+      target: {:function, {m, f, a}},
+      pure: Keyword.get(opts, :pure, false)
+    })
+  end
+
+  @doc """
+  Register a composition of loaded functions, described as data, under its
+  own key — composing two functions yields a new catalog entry.
+
+  See `SetmyInfo.ElixirModuleLoader.Composite` for the AST node types
+  (`{:ref, key}`, `{:ref, key, function}`, `{:partial, key, function, args}`,
+  `{:pipe, [stages]}`). A pipe stage returning `{:error, _}` short-circuits.
+
+  Returns `{:error, :invalid_composite}` for a malformed AST.
+  """
+  @spec register_composite(key_or_uuid(), term()) :: :ok | {:error, :invalid_composite}
+  def register_composite(key_or_uuid, ast) do
+    if Composite.valid?(ast) do
+      Registry.register(normalize(key_or_uuid), Composite, %{target: {:composite, ast}})
+    else
+      {:error, :invalid_composite}
+    end
+  end
 
   @doc """
   Register many `{key_or_uuid, module}` pairs at once — more efficient than
@@ -142,7 +246,11 @@ defmodule SetmyInfo.ElixirModuleLoader do
     end
   end
 
-  @doc "Remove a key→module mapping. Does NOT unload an active Worker."
+  @doc "Look up which module atom is registered under a UUID string or key."
+  @spec lookup(key_or_uuid()) :: {:ok, module()} | {:error, :not_found}
+  def lookup(key_or_uuid), do: Registry.lookup(normalize(key_or_uuid))
+
+  @doc "Remove a key→module mapping. Does NOT release a loaded key."
   @spec unregister(key_or_uuid()) :: :ok
   def unregister(key_or_uuid), do: Registry.unregister(normalize(key_or_uuid))
 
@@ -150,52 +258,142 @@ defmodule SetmyInfo.ElixirModuleLoader do
   @spec registered?(key_or_uuid()) :: boolean()
   def registered?(key_or_uuid), do: Registry.registered?(normalize(key_or_uuid))
 
-  # ── Loader ───────────────────────────────────────────────────────────────────
+  @doc "All registered `{key, module}` pairs (keys as 16-byte binaries)."
+  @spec list_registered() :: [{key(), module()}]
+  defdelegate list_registered, to: Registry
 
-  @doc "Load the module registered under `key_or_uuid` (starts a supervised Worker)."
-  @spec load(key_or_uuid()) :: {:ok, pid()} | {:error, term()}
+  @doc "Number of registered keys."
+  @spec count() :: non_neg_integer()
+  defdelegate count, to: Registry
+
+  # ── Loaded working set ───────────────────────────────────────────────────────
+
+  @doc """
+  Load the entry registered under `key_or_uuid` and return **the module** —
+  call its functions directly, no further registry or dispatch involved.
+
+  If the code was purged by an earlier `release/1`, it is restored first from
+  the registered source (`.beam` file, `.ex` recompile, or in-memory binary).
+  Idempotent: loading a loaded key returns the same module.
+  """
+  @spec load(key_or_uuid()) :: {:ok, module()} | {:error, term()}
   def load(key_or_uuid), do: Loader.load(normalize(key_or_uuid))
 
-  @doc "Reload the module: terminate any existing Worker and start a fresh one."
-  @spec reload(key_or_uuid()) :: {:ok, pid()} | {:error, term()}
+  @doc """
+  Re-restore the module's code from its registered source (recompile the
+  `.ex`, reload the `.beam`/binary), hot-swapping the loaded version.
+  """
+  @spec reload(key_or_uuid()) :: {:ok, module()} | {:error, term()}
   def reload(key_or_uuid), do: Loader.reload(normalize(key_or_uuid))
 
-  @doc "Release the module registered under `key_or_uuid` (terminates the Worker)."
+  @doc """
+  Release the entry loaded under `key_or_uuid`.
+
+  Removes the key from the loaded working set and, when the code is
+  library-managed and no other loaded key uses the same module, deletes and
+  soft-purges the module's code from the VM. The key stays registered and can
+  be loaded again later — the code is restored automatically.
+  """
   @spec release(key_or_uuid()) :: :ok | {:error, :not_loaded}
   def release(key_or_uuid), do: Loader.release(normalize(key_or_uuid))
 
-  @doc "True if a Worker is currently running for `key_or_uuid`."
+  @doc "True if `key_or_uuid` is currently in the loaded working set."
   @spec loaded?(key_or_uuid()) :: boolean()
   def loaded?(key_or_uuid), do: Loader.loaded?(normalize(key_or_uuid))
 
-  @doc "Return the Worker PID for `key_or_uuid` if currently loaded."
-  @spec pid_for(key_or_uuid()) :: {:ok, pid()} | {:error, :not_loaded}
-  def pid_for(key_or_uuid), do: Loader.pid_for(normalize(key_or_uuid))
-
-  # ── Execution ────────────────────────────────────────────────────────────────
+  @doc "All currently loaded keys (16-byte binaries)."
+  @spec list_loaded() :: [key()]
+  defdelegate list_loaded, to: Loader
 
   @doc """
-  Execute `function(args)` on the Worker loaded under `key_or_uuid`.
-
-  An optional `timeout` (ms, default #{@default_timeout}) bounds the call; a
-  plugin exceeding it returns `{:error, :timeout}` without crashing the caller.
+  When `key_or_uuid` was loaded, for external systems deciding what is no
+  longer in use. (Call-level usage tracking is the external system's concern —
+  the library does not intercept calls.)
   """
-  @spec execute(key_or_uuid(), atom(), [term()], timeout()) ::
-          {:ok, term()} | {:error, term()}
-  def execute(key_or_uuid, function, args, timeout \\ @default_timeout),
-    do: Worker.execute(normalize(key_or_uuid), function, args, timeout)
+  @spec loaded_at(key_or_uuid()) :: {:ok, DateTime.t()} | {:error, :not_loaded}
+  def loaded_at(key_or_uuid), do: Loader.loaded_at(normalize(key_or_uuid))
 
-  @doc "Load module (if not already loaded), execute, then keep it loaded."
-  @spec run(key_or_uuid(), atom(), [term()]) :: {:ok, term()} | {:error, term()}
-  def run(key_or_uuid, function, args),
-    do: Executor.run(normalize(key_or_uuid), function, args)
+  # ── Functions as values ──────────────────────────────────────────────────────
 
-  @doc "Load, execute, then immediately release the module."
-  @spec run_and_release(key_or_uuid(), atom(), [term()]) :: {:ok, term()} | {:error, term()}
-  def run_and_release(key_or_uuid, function, args),
-    do: Executor.run_and_release(normalize(key_or_uuid), function, args)
+  @doc """
+  The functions a key exports, as `[{name, arity}]` — for callers that do not
+  know the loaded code in advance (AI-generated or catalog modules). Loads
+  the key (restoring code if needed).
+
+  Module targets list the module's public functions; a function target lists
+  its one `{name, arity}`; a composite lists `[call: 1]`.
+  """
+  @spec functions(key_or_uuid()) :: {:ok, [{atom(), non_neg_integer()}]} | {:error, term()}
+  def functions(key_or_uuid) do
+    key = normalize(key_or_uuid)
+
+    case Registry.lookup_entry(key) do
+      {:ok, _m, %{target: {:function, {_m2, f, a}}}} ->
+        {:ok, [{f, a}]}
+
+      {:ok, _m, %{target: {:composite, _}}} ->
+        {:ok, [call: 1]}
+
+      {:ok, _m, _meta} ->
+        with {:ok, module} <- Loader.load(key), do: {:ok, exported_functions(module)}
+
+      {:error, :not_found} = error ->
+        error
+    end
+  end
+
+  @doc """
+  Capture the function or composite registered under `key_or_uuid` as a
+  first-class Elixir function value of its registered arity.
+
+  The closure is late-bound (it resolves the key on every call), returns the
+  raw result of the underlying code, and is usable anywhere a function is —
+  `Enum`, `Stream`, `Task`, or as an argument to another loaded function.
+  Pure function targets are memoised.
+
+  Raises `ArgumentError` for unregistered keys; for whole-module keys use
+  `fun/3` with an explicit function name and arity.
+  """
+  @spec fun(key_or_uuid()) :: function()
+  def fun(key_or_uuid) do
+    key = normalize(key_or_uuid)
+
+    case Registry.lookup_entry(key) do
+      {:ok, _m, %{target: {:function, {_, _, arity}}}} ->
+        Fn.make_closure(arity, &Fn.invoke(key, &1))
+
+      {:ok, _m, %{target: {:composite, _}}} ->
+        Fn.make_closure(1, &Fn.invoke(key, &1))
+
+      {:ok, _m, _meta} ->
+        raise ArgumentError,
+              "key addresses a whole module — use fun/3 with a function name and arity"
+
+      {:error, :not_found} ->
+        raise ArgumentError, "no entry registered under #{inspect(key_or_uuid)}"
+    end
+  end
+
+  @doc """
+  Capture `function` (of `arity`, default 1) of the module registered under
+  `key_or_uuid` as a first-class closure. The module is loaded on demand at
+  call time (late-bound), so the capture survives release/reload cycles.
+  """
+  @spec fun(key_or_uuid(), atom(), non_neg_integer()) :: function()
+  def fun(key_or_uuid, function, arity \\ 1) when is_atom(function) do
+    key = normalize(key_or_uuid)
+    Fn.make_closure(arity, fn args -> Fn.apply_module(key, function, args) end)
+  end
 
   # ── Private ───────────────────────────────────────────────────────────────────
+
+  defp exported_functions(module) do
+    if function_exported?(module, :__info__, 1) do
+      module.__info__(:functions)
+    else
+      for {f, a} <- module.module_info(:exports), f != :module_info, do: {f, a}
+    end
+  end
 
   # Accept either key form. A 16-byte binary passes through unchanged; a UUID
   # string is converted to its binary key. Anything else raises ArgumentError.
@@ -220,12 +418,4 @@ defmodule SetmyInfo.ElixirModuleLoader do
   end
 
   defp normalize_specs(_, _), do: :error
-
-  defp compile_or_load(path) do
-    if String.ends_with?(path, ".beam") do
-      load_beam_file(path)
-    else
-      with {:ok, [{module, _binary} | _]} <- compile_file(path), do: {:ok, module}
-    end
-  end
 end

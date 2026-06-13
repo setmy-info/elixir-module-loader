@@ -1,7 +1,7 @@
 defmodule SetmyInfo.ElixirModuleLoader.E2E.UUIDFlowTest do
   @moduledoc """
-  End-to-end test of the UUID-facing API: a Library user generates a UUID,
-  registers a module file under it, then loads / requests / releases by UUID.
+  End-to-end test of the UUID-facing API: a library user generates a UUID,
+  registers a module file under it, then loads / calls / releases by UUID.
   Also verifies UUID and 128-bit forms address the same registry entry.
   """
 
@@ -25,28 +25,33 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.UUIDFlowTest do
       {:ok, uuid: uuid}
     end
 
-    test "register a .ex file, then request and release by UUID", %{uuid: uuid} do
+    test "register a .ex file, then load and call by UUID", %{uuid: uuid} do
       assert {:ok, @module} = ML.register_file(uuid, @fixture_path)
       assert ML.registered?(uuid)
 
-      assert {:ok, _pid} = ML.load(uuid)
+      {:ok, module} = ML.load(uuid)
       assert ML.loaded?(uuid)
-      assert {:ok, 5} = ML.execute(uuid, :add, [2, 3])
+      assert 5 == module.add(2, 3)
 
       assert :ok = ML.release(uuid)
       refute ML.loaded?(uuid)
     end
 
-    test "run_and_release/3 by UUID", %{uuid: uuid} do
+    test "load → call → release pattern by UUID", %{uuid: uuid} do
       {:ok, @module} = ML.register_file(uuid, @fixture_path)
       refute ML.loaded?(uuid)
-      assert {:ok, 12} = ML.run_and_release(uuid, :multiply, [3, 4])
+
+      {:ok, module} = ML.load(uuid)
+      result = module.multiply(3, 4)
+      :ok = ML.release(uuid)
+
+      assert result == 12
       refute ML.loaded?(uuid)
     end
   end
 
   describe "UUID and 128-bit forms are interchangeable" do
-    test "register by UUID, look up / execute by its binary key" do
+    test "register by UUID, look up and call by its binary key" do
       uuid = ML.generate_uuid()
       key = UUID.to_key!(uuid)
 
@@ -61,8 +66,8 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.UUIDFlowTest do
       assert {:ok, @module} = ML.lookup(key)
       assert ML.registered?(key)
 
-      {:ok, _pid} = ML.load(key)
-      assert {:ok, 7} = ML.execute(key, :add, [3, 4])
+      {:ok, module} = ML.load(key)
+      assert 7 == module.add(3, 4)
     end
 
     test "register by binary key, release by UUID" do
@@ -75,7 +80,7 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.UUIDFlowTest do
       end)
 
       :ok = ML.register(key, @module)
-      {:ok, _pid} = ML.load(uuid)
+      {:ok, _module} = ML.load(uuid)
       assert ML.loaded?(key)
       assert :ok = ML.release(uuid)
       refute ML.loaded?(key)
