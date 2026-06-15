@@ -5,9 +5,8 @@ lifecycle management as a reusable OTP library.
 
 Compile Elixir source strings or `.ex` / `.beam` files at runtime, register
 the resulting modules under cryptographically-random 128-bit keys (as raw
-binaries **or** UUID strings), load them into supervised Worker processes,
-execute their functions, and release them — all in a process-safe OTP
-supervision tree.
+binaries **or** UUID strings), load them into the VM on demand, and release
+them — all in a process-safe OTP supervision tree.
 
 ## Installation
 
@@ -16,7 +15,7 @@ Add `elixir_module_loader` to your `mix.exs` dependencies:
 ```elixir
 def deps do
   [
-    {:elixir_module_loader, "~> 1.0"}
+    {:elixir_module_loader, "~> 1.1"}
   ]
 end
 ```
@@ -24,274 +23,450 @@ end
 ## Quick start
 
 ```elixir
-alias SetmyInfo.ElixirModuleLoader
+alias SetmyInfo.ElixirModuleLoader, as: EML
 
-# 1. Compile a module (source string, .ex file, or .beam file)
-{:ok, _} = ElixirModuleLoader.compile("""
-  defmodule MyPlugin do
-    @behaviour SetmyInfo.ElixirModuleLoader.Behaviour
-    def name, do: :my_plugin
-    def execute(:greet, [name]), do: {:ok, "Hello, \#{name}!"}
-    def execute(f, _), do: {:error, {:undefined_function, f}}
+# 1. Compile source — module is immediately loaded, key auto-assigned
+{:ok, key, _module} = EML.compile("""
+  defmodule SetmyInfo.Demo.Plugin do
+    def greet(name), do: "Hello, \#{name}!"
   end
 """)
 
-# 2. Generate a 128-bit key and register the module
-key = ElixirModuleLoader.generate_key()
-:ok  = ElixirModuleLoader.register(key, MyPlugin)
+# 2. Discover what functions the module exports (function names may not be
+#    known at compile time — they come from external systems)
+{:ok, exports} = EML.functions(key)
+#=> {:ok, [greet: 1]}
 
-# 3. Load (starts a supervised Worker process)
-{:ok, _pid} = ElixirModuleLoader.load(key)
+# 3. Capture a function by name and call it with a list of arguments
+{:ok, greet_fn} = EML.get_function(key, "greet", 1)
+"Hello, World!" = greet_fn.(["World"])
 
-# 4. Execute a function
-{:ok, "Hello, World!"} = ElixirModuleLoader.execute(key, :greet, ["World"])
-
-# 5. Release (terminates the Worker, frees resources)
-:ok = ElixirModuleLoader.release(key)
+# 4. Release when done — frees the working-set slot and purges code from the VM
+:ok = EML.release(key)
 ```
-
-One-call shortcuts — no manual load/release needed:
-
-```elixir
-# Load (if not already loaded), execute, keep Worker running
-{:ok, result} = ElixirModuleLoader.run(key, :greet, ["World"])
-
-# Load, execute, release — atomically
-{:ok, result} = ElixirModuleLoader.run_and_release(key, :greet, ["World"])
-```
-
-## Quick start (UUID)
-
-Prefer a human-readable identifier? Every key-taking function also accepts a
-UUID string, and `register_file/2` compiles-or-loads a file and registers it
-in one call:
-
-```elixir
-alias SetmyInfo.ElixirModuleLoader
-
-# 1. Generate a UUID for the module
-uuid = ElixirModuleLoader.generate_uuid()
-#=> "8c7f2a3e-1b4d-4e6f-9a0b-3c5d7e9f1a2b"
-
-# 2. Compile a .ex file (or load a .beam file) and register under the UUID
-{:ok, _module} = ElixirModuleLoader.register_file(uuid, "plugins/my_plugin.ex")
-
-# 3. Request the module by UUID and run it
-{:ok, _pid}   = ElixirModuleLoader.load(uuid)
-{:ok, result} = ElixirModuleLoader.execute(uuid, :greet, ["World"])
-
-# 4. Release by UUID
-:ok = ElixirModuleLoader.release(uuid)
-```
-
-`register_file/2` picks the loader by extension: a path ending in `.beam` is
-loaded as a pre-compiled binary, anything else is compiled as Elixir source.
 
 ## Key type
 
-All key-taking functions accept **either** form interchangeably:
+Every registered module is addressed by a 128-bit key. All key-taking
+functions accept **either** form interchangeably:
 
-* a **UUID string** — `"550e8400-e29b-41d4-a716-446655440000"` (`generate_uuid/0`)
-* a **16-byte binary** — `<<_::128>>` (`generate_key/0`)
-
-```elixir
-key  = SetmyInfo.ElixirModuleLoader.generate_key()   # :crypto.strong_rand_bytes(16)
-uuid = SetmyInfo.ElixirModuleLoader.generate_uuid()  # random UUIDv4 string
-```
-
-A UUID is exactly 128 bits, so the two forms address the same registry entry —
-register under a UUID and look up with its binary form (or vice versa) and you
-reach the same module. Convert explicitly with the `SetmyInfo.ElixirModuleLoader.UUID`
-helper:
+- a **16-byte binary** — `<<_::128>>` from `generate_key/0`
+- a **UUID string** — `"550e8400-e29b-41d4-a716-446655440000"` from `generate_uuid/0`
 
 ```elixir
-alias SetmyInfo.ElixirModuleLoader.UUID
+key  = EML.generate_key()    # :crypto.strong_rand_bytes(16)
+uuid = EML.generate_uuid()   # random UUIDv4 string
 
-key  = UUID.to_key!("550e8400-e29b-41d4-a716-446655440000")  # → <<_::128>>
-uuid = UUID.from_key(key)                                    # → "550e8400-..."
-UUID.uuid_string?(uuid)                                      # → true
+# Convert between forms
+uuid = EML.key_to_uuid(key)
 ```
-
-## Implementing the Behaviour
-
-```elixir
-defmodule MyPlugin do
-  @behaviour SetmyInfo.ElixirModuleLoader.Behaviour
-
-  @impl SetmyInfo.ElixirModuleLoader.Behaviour
-  def name, do: :my_plugin
-
-  @impl SetmyInfo.ElixirModuleLoader.Behaviour
-  def execute(:add, [a, b]) when is_number(a) and is_number(b), do: {:ok, a + b}
-  def execute(f, _), do: {:error, {:undefined_function, f}}
-end
-```
-
-The behaviour requires two callbacks:
-
-| Callback          | Signature                                    | Description                          |
-|-------------------|----------------------------------------------|--------------------------------------|
-| `name/0`          | `() :: atom()`                               | Unique atom identifying this module  |
-| `execute/2`       | `(atom(), [term()]) :: {:ok, term()} \| {:error, term()}` | Dispatch by function name |
-
-## Built-in example modules
-
-Two ready-to-use implementations ship with the library.
-
-### `SetmyInfo.ElixirModuleLoader.Modules.Math`
-
-| Function     | Arguments      | Returns                            |
-|--------------|----------------|------------------------------------|
-| `:add`       | `[a, b]`       | `{:ok, a + b}`                     |
-| `:subtract`  | `[a, b]`       | `{:ok, a - b}`                     |
-| `:multiply`  | `[a, b]`       | `{:ok, a * b}`                     |
-| `:divide`    | `[a, b]`       | `{:ok, a / b}` or `{:error, :division_by_zero}` |
-
-```elixir
-alias SetmyInfo.ElixirModuleLoader
-alias SetmyInfo.ElixirModuleLoader.Modules.Math
-
-key = ElixirModuleLoader.generate_key()
-ElixirModuleLoader.register(key, Math)
-{:ok, _} = ElixirModuleLoader.load(key)
-{:ok, 5} = ElixirModuleLoader.execute(key, :add, [2, 3])
-{:ok, 2.5} = ElixirModuleLoader.execute(key, :divide, [5, 2])
-{:error, :division_by_zero} = ElixirModuleLoader.execute(key, :divide, [1, 0])
-```
-
-### `SetmyInfo.ElixirModuleLoader.Modules.StringOps`
-
-| Function     | Arguments | Returns                   |
-|--------------|-----------|---------------------------|
-| `:upcase`    | `[s]`     | `{:ok, String.upcase(s)}` |
-| `:downcase`  | `[s]`     | `{:ok, String.downcase(s)}` |
-| `:reverse`   | `[s]`     | `{:ok, String.reverse(s)}` |
-| `:length`    | `[s]`     | `{:ok, String.length(s)}` |
-| `:trim`      | `[s]`     | `{:ok, String.trim(s)}`   |
 
 ## API reference
 
-All functions live on `SetmyInfo.ElixirModuleLoader`. Every `key` parameter
-below accepts **either** a 16-byte binary or a UUID string.
+All functions live on `SetmyInfo.ElixirModuleLoader`.
 
 ### Compilation
 
-| Function                        | Description                                              |
-|---------------------------------|----------------------------------------------------------|
-| `compile(source)`               | Compile an Elixir source string, load modules into the VM |
-| `compile_file(path)`            | Compile an Elixir `.ex` file, load modules into the VM   |
-| `load_beam_file(path)`          | Load a pre-compiled `.beam` file from disk               |
-| `load_beam_binary(name, binary)`| Load a BEAM binary already in memory                     |
+| Function | Returns | Description |
+|---|---|---|
+| `compile(source)` | `{:ok, key, module}` | Compile source string, auto-register, load immediately |
+| `compile(source, load: false)` | `{:ok, [{module, binary}]}` | Compile only — no library registration |
+| `compile_file(path)` | `{:ok, key, module}` | Compile `.ex` file or load `.beam`, auto-register |
+| `compile_file(path, load: false)` | `{:ok, [{module, binary}]}` | Compile `.ex` only — no library registration |
 
-### Registry
+### Loading under caller-provided keys
 
-| Function                    | Description                                                   |
-|-----------------------------|---------------------------------------------------------------|
-| `generate_key()`            | Generate a cryptographically-random 128-bit binary key        |
-| `generate_uuid()`           | Generate a random version-4 UUID string                       |
-| `register(key, module)`     | Register a module atom under a key or UUID                    |
-| `register_file(key, path)`  | Compile (`.ex`) or load (`.beam`) a file and register it under a key or UUID |
-| `register_many(specs)`      | Register many `{key, module}` pairs at once                   |
-| `lookup(key)`               | Look up which module is registered under a key                |
-| `unregister(key)`           | Remove a key → module mapping (does not stop the Worker)      |
-| `registered?(key)`          | Check if a key is currently registered                        |
+| Function | Returns | Description |
+|---|---|---|
+| `load_binary(uuid, module, binary)` | `{:ok, module}` | Register a pre-compiled BEAM binary under caller UUID — no recompilation |
+| `load_source(uuid, source)` | `{:ok, module}` | Compile source, register under caller UUID, load |
+| `load_file(uuid, path)` | `{:ok, module}` | Compile `.ex` / load `.beam`, register under caller UUID, load |
+| `load_by_name(module_atom)` | `{:ok, key, module}` | Register an already-compiled module, auto-assign key |
 
-The `SetmyInfo.ElixirModuleLoader.UUID` module provides the conversion
-helpers: `generate/0`, `to_key/1`, `to_key!/1`, `from_key/1`, `uuid_string?/1`.
+### Working set
 
-### Lifecycle
+| Function | Returns | Description |
+|---|---|---|
+| `load(key_or_uuid)` | `{:ok, module}` or `{:error, term}` | Load (or restore) a registered module |
+| `release(key_or_uuid)` | `:ok` or `{:error, :not_loaded}` | Remove from working set; purge library-managed code |
+| `loaded?(key_or_uuid)` | `boolean` | Check if currently in the working set (lock-free ETS read) |
+| `functions(key_or_uuid)` | `{:ok, [{name, arity}]}` or `{:error, term}` | List exported functions; auto-loads the key if not yet loaded |
+| `get_function(key_or_uuid, name, arity)` | `{:ok, fun}` or `{:error, :not_found}` | Capture a function by name (atom or string) as a `([args] -> result)` closure |
 
-| Function          | Description                                                          |
-|-------------------|----------------------------------------------------------------------|
-| `load(key)`       | Start a supervised Worker for the key; returns existing PID if already loaded |
-| `reload(key)`     | Terminate any existing Worker and start a fresh one                  |
-| `release(key)`    | Terminate the Worker and free resources                              |
-| `loaded?(key)`    | Check if a Worker is currently running for the key                   |
-| `pid_for(key)`    | Return the Worker PID for a key, or `{:error, :not_loaded}`          |
+### Key management
 
-### Execution
+| Function | Returns | Description |
+|---|---|---|
+| `generate_key()` | `<<_::128>>` | Cryptographically-random 128-bit binary key |
+| `generate_uuid()` | `String.t()` | Random version-4 UUID string |
+| `key_to_uuid(key)` | `String.t()` | Convert binary key to UUID string |
 
-| Function                          | Description                                                    |
-|-----------------------------------|----------------------------------------------------------------|
-| `execute(key, function, args, timeout \\\\ 5000)` | Execute a function on the already-loaded Worker; `{:error, :timeout}` if it exceeds `timeout` ms |
-| `run(key, function, args)`        | Load (if needed), execute, leave Worker running                |
-| `run_and_release(key, function, args)` | Load, execute, release — full lifecycle in one call       |
+## No imposed interface
 
-## Bulk registration
-
-```elixir
-specs = [
-  {key_a, PluginA},
-  {key_b, PluginB}
-]
-:ok = SetmyInfo.ElixirModuleLoader.register_many(specs)
-```
-
-## Hot reload
-
-After recompiling a module with `compile/1` or `compile_file/1`, existing
-Worker processes automatically pick up the new code on their next call —
-no restart required:
+The library does not require loadable modules to implement any callbacks,
+expose specific function names, or follow any naming convention. Function
+names are not known at compile time — they come from external systems
+(databases, configuration, HTTP parameters). The caller discovers them at
+runtime using `functions/1` and invokes them via `get_function/3`:
 
 ```elixir
-{:ok, _} = SetmyInfo.ElixirModuleLoader.compile(new_source)
-# Workers already running under key now use the new code automatically
-{:ok, result} = SetmyInfo.ElixirModuleLoader.execute(key, :some_function, [])
+# Discover available functions
+{:ok, exports} = EML.functions(key)
+#=> {:ok, [mask_first_name: 1, mask_last_name: 1]}
+
+# Capture a function whose name came from config or an external system
+fn_name = fetch_fn_name_from_db()   # e.g. "mask_first_name"
+{:ok, fun} = EML.get_function(key, fn_name, 1)
+masked = fun.(["Alice"])             # → "A****"
+
+# Compose with standard Elixir — combine closures at runtime
+names = ["Alice", "Bob", "Carol"]
+masked_names = Enum.map(names, &fun.([&1]))
 ```
 
-To also reset Worker state (call count, etc.), use `reload/1`:
+Alternatively, once the module atom is returned by `load/1`, `apply/3` is
+always available for dynamic dispatch by atom name:
 
 ```elixir
-{:ok, _new_pid} = SetmyInfo.ElixirModuleLoader.reload(key)
+{:ok, module} = EML.load(key)
+apply(module, String.to_existing_atom(fn_name), [arg])
 ```
+
+## Deferred loading — compile now, load later
+
+The `load: false` option enables a build/pre-compile phase that produces
+BEAM binaries without registering them. The caller then decides when to
+load each one on demand using `load_source/2` or `load_file/2`.
+
+This pattern scales to millions or billions of UUID-keyed modules on disk
+that cannot all be loaded at once:
+
+```elixir
+alias SetmyInfo.ElixirModuleLoader, as: EML
+
+# Build phase — compile source ONCE; keep the binary
+{:ok, [{module, binary}]} = EML.compile(source, load: false)
+# Optionally persist `binary` to a .beam file on disk / cache
+
+# Request phase — load from binary, no recompilation
+uuid = EML.generate_uuid()
+{:ok, ^module} = EML.load_binary(uuid, module, binary)
+# or compile from file on demand:
+# {:ok, _} = EML.load_file(uuid, "path/to/plugin.ex")
+
+# Function name comes from the external system — discover at runtime
+{:ok, exports} = EML.functions(uuid)               # [{:transform, 1}, ...]
+fn_name = get_fn_name_from_config_or_db()          # "transform"
+{:ok, fun} = EML.get_function(uuid, fn_name, 1)
+result = fun.([data])
+
+# Release phase — free working-set slot and code memory
+:ok = EML.release(uuid)
+```
+
+## Masking use case
+
+A REST endpoint loads per-request masking modules under UUID keys, masks
+PII data, then releases to free memory. Function names arrive from the
+external system — the caller never hardcodes them.
+
+```elixir
+alias SetmyInfo.ElixirModuleLoader, as: EML
+
+# Input and output data shapes (caller-owned, in SetmyInfo namespace)
+defmodule SetmyInfo.Demo.Person,    do: defstruct [:first_name, :last_name]
+defmodule SetmyInfo.Demo.PersonDTO, do: defstruct [:first_name, :last_name]
+
+alias SetmyInfo.Demo.{Person, PersonDTO}
+
+# Sources under UUID-named folders on disk (all in SetmyInfo namespace)
+first_name_masker_source = """
+defmodule SetmyInfo.Masking.FirstNameMasker do
+  def mask_first_name(nil), do: nil
+  def mask_first_name(""), do: ""
+  def mask_first_name(<<first::binary-size(1), rest::binary>>) do
+    first <> String.duplicate("*", String.length(rest))
+  end
+end
+"""
+
+last_name_masker_source = """
+defmodule SetmyInfo.Masking.LastNameMasker do
+  def mask_last_name(nil), do: nil
+  def mask_last_name(value) when is_binary(value) do
+    String.duplicate("*", String.length(value))
+  end
+end
+"""
+
+# Caller generates UUIDs for each masking module
+fn_uuid = EML.generate_uuid()
+ln_uuid = EML.generate_uuid()
+
+# Load maskers under their UUIDs
+{:ok, _} = EML.load_source(fn_uuid, first_name_masker_source)
+{:ok, _} = EML.load_source(ln_uuid, last_name_masker_source)
+
+# Caller discovers function names at runtime (or receives them from config/DB)
+{:ok, fn_exports} = EML.functions(fn_uuid)
+#=> {:ok, [mask_first_name: 1]}
+
+# Capture functions by name — only the caller knows what functions are present
+fn_name = "mask_first_name"   # from external system
+ln_name = "mask_last_name"
+
+{:ok, mask_fn} = EML.get_function(fn_uuid, fn_name, 1)
+{:ok, mask_ln} = EML.get_function(ln_uuid, ln_name, 1)
+
+# Caller builds the full masking lambda — library is not involved in calling
+person = %Person{first_name: "John", last_name: "Doe"}
+
+full_masking_function = fn p ->
+  %PersonDTO{
+    first_name: mask_fn.([p.first_name]),
+    last_name:  mask_ln.([p.last_name])
+  }
+end
+
+dto = full_masking_function.(person)
+#=> %PersonDTO{first_name: "J***", last_name: "***"}
+
+# Release after the request — code purged from VM
+:ok = EML.release(fn_uuid)
+:ok = EML.release(ln_uuid)
+```
+
+See `test/integration/masking_test.exs` for the full runnable version
+including the build-phase (compile without loading) pattern
+(run with `mix test.integration`).
+
+## SetmyInfo.Modules — folder-based loader
+
+`SetmyInfo.Modules` is a higher-level layer on top of `SetmyInfo.ElixirModuleLoader`
+that manages modules stored as files on disk, grouped by UUID-named folders under a
+single process-wide **root path**.
+
+### Folder convention
+
+Each UUID maps to a folder containing one Elixir source file and, after compilation,
+a corresponding `.beam` file. Both the UUID and the source file name are supplied in a
+`%SetmyInfo.Modules.Request{}` struct — the library imposes no naming convention.
+
+```
+{root_path}/
+  550e8400-e29b-41d4-a716-446655440000/
+    Masker.ex                       ← source; file_name in the Request
+    Elixir.SetmyInfo.Masking.Masker.beam  ← written by compile/1, read by load/1
+```
+
+### Two-phase workflow
+
+Compilation and loading are fully independent steps:
+
+1. **Compile** — translate the `.ex` source to a `.beam` file on disk. Nothing is
+   loaded into the VM or registered. This step may happen in a separate process, at
+   deploy time, or long before any request arrives. Pre-compiled `.beam` files placed
+   in the UUID folder by any external means are equally supported.
+
+2. **Load** — read the `.beam` file from disk, load it into the VM, and register the
+   module under the UUID in EML. No recompilation; no in-memory binary passing from
+   the compile step.
+
+### Request struct
+
+```elixir
+alias SetmyInfo.Modules.Request
+
+request = %Request{uuid: uuid, file_name: "Masker.ex"}
+```
+
+Both `:uuid` and `:file_name` are required fields.
+
+### Path safety
+
+`uuid` and `file_name` arrive from external systems, so both are validated
+before any path is built — a caller-supplied value can never escape the
+configured root path:
+
+- `uuid` must be a well-formed UUID string. Any other value — including one
+  containing `/` or `..` — is rejected with `{:error, :invalid_uuid}`. This is
+  enforced wherever a path is built: `uuid_path/1`, `module_path/1`,
+  `compile/1`, and `load/1`.
+- `file_name` must be a plain file name inside the UUID folder — no directory
+  separators and no `.`/`..` segments — otherwise `{:error, :invalid_file_name}`.
+  This is enforced wherever `file_name` is used to build a path:
+  `module_path/1` and `compile/1`.
+
+```elixir
+Modules.uuid_path("../../etc")                                  #=> {:error, :invalid_uuid}
+Modules.module_path(%Request{uuid: uuid, file_name: "../x.ex"}) #=> {:error, :invalid_file_name}
+```
+
+### Path helpers
+
+```elixir
+alias SetmyInfo.Modules
+alias SetmyInfo.Modules.Request
+
+Modules.set_root_path("/var/app/modules")
+
+{:ok, "/var/app/modules/550e8400-..."}           = Modules.uuid_path(uuid)
+{:ok, "/var/app/modules/550e8400-.../Masker.ex"} = Modules.module_path(%Request{uuid: uuid, file_name: "Masker.ex"})
+```
+
+### Workflow
+
+```elixir
+alias SetmyInfo.Modules
+alias SetmyInfo.Modules.Request
+alias SetmyInfo.ElixirModuleLoader, as: EML
+
+# Once at startup
+:ok = Modules.set_root_path("/var/app/modules")
+
+request = %Request{uuid: uuid, file_name: "Masker.ex"}
+
+# Build phase (separate process / deploy time) — compile .ex → .beam on disk
+{:ok, [beam_path]} = Modules.compile(request)
+
+# Request phase — load from .beam on disk, no recompilation
+{:ok, _module} = Modules.load(request)
+
+# Discover and invoke functions by name (from config / DB)
+{:ok, fun} = EML.get_function(uuid, fn_name, 1)
+result = fun.([data])
+
+# Release when done
+:ok = EML.release(uuid)
+```
+
+### Loading a pre-compiled `.beam`
+
+`Modules.load/1` scans the UUID folder for any `.beam` file — it does not require
+that `Modules.compile/1` was used to produce it. A `.beam` compiled externally (by
+`mix compile`, another service, or a CI pipeline) and placed in the UUID folder works
+identically.
+
+See `test/integration/modules_integration_test.exs` for runnable examples
+(run with `mix test.integration`).
+
+## Memory management
+
+The library manages code memory for modules it compiled:
+
+- `release/1` removes the key from the loaded working set. When no other
+  loaded key uses the same module, the BEAM code is deleted and soft-purged
+  from the VM.
+- Purging is **reference-counted** — a module shared by multiple keys stays
+  in the VM until the last key is released.
+- A subsequent `load/1` transparently restores purged code from the stored
+  BEAM binary or by recompiling the `.ex` source file. The key remains
+  addressable at all times.
+- Modules loaded via `load_by_name/1` (externally compiled) are never
+  purged — the library does not own code it did not compile.
+
+```elixir
+{:ok, _module} = EML.load_source(uuid, source)
+{:ok, fun} = EML.get_function(uuid, "transform", 1)
+result = fun.([data])
+:ok = EML.release(uuid)         # code freed from VM
+{:ok, fun} = EML.get_function(uuid, "transform", 1)  # code transparently restored
+result2 = fun.([data])
+```
+
+## Architecture
+
+```mermaid
+graph TD
+    subgraph CALLER["Caller Application"]
+        APP["Application Code"]
+    end
+
+    subgraph L2["Layer 2 · SetmyInfo.Modules  —  folder convention"]
+        SM["set_root_path · root_path\nuuid_path · module_path\ncompile · load"]
+    end
+
+    subgraph L1["Layer 1 · SetmyInfo.ElixirModuleLoader  —  core API"]
+        F["Public Facade\ncompile · compile_file\nload_source · load_file · load_binary\nload · release · loaded?\nfunctions · get_function"]
+
+        C["Compiler\nCode.compile_string / compile_file\n:code.load_binary / :code.load_abs\nsoft_purge · delete"]
+
+        subgraph OTP["Supervisor  ·  rest_for_one"]
+            R["Registry  GenServer + ETS\nkey → module + beam_source"]
+            LD["Loader  GenServer + ETS\nkey → module + loaded_at\nref-counted purge / restore"]
+            CL["CompileLock  GenServer\ncompile mutex"]
+        end
+    end
+
+    subgraph BEAM["BEAM Virtual Machine"]
+        E1[("ETS: registry")]
+        E2[("ETS: loaded set")]
+        CS[":code server"]
+    end
+
+    APP -->|"folder-based loading"| SM
+    APP -->|"direct low-level API"| F
+    SM -->|"compile_file · load_file"| F
+
+    F --> R
+    F --> LD
+    F -->|"compile request"| CL
+    CL -->|"run_compile"| C
+    LD -->|"restore purged code"| C
+
+    R <-->|"read / write"| E1
+    LD <-->|"read / write"| E2
+    C <-->|"load / purge / delete"| CS
+```
+
+**Layer 2** (`SetmyInfo.Modules`) is a thin path-and-convention layer. It provides two
+independent steps: `compile/1` translates a `.ex` source to a `.beam` file on disk
+(build phase), and `load/1` reads the `.beam` from disk and delegates to Layer 1 to
+register the module (request phase). All runtime operations (`get_function`, `release`,
+`functions`) go directly through Layer 1 — Layer 2 exposes no duplicated API for them.
+
+**Layer 1** (`SetmyInfo.ElixirModuleLoader`) is the core library and can be used standalone
+without Layer 2. The three OTP processes under the supervisor are independent: Registry handles
+registration, Loader handles the working set and code lifecycle, and CompileLock serialises
+compilation to protect the VM-global compiler flag.
 
 ## Supervision tree
 
 ```
-ApplicationSupervisor (one_for_one)
-├── WorkerRegistry          — Elixir Registry for named Worker lookup
-└── Supervisor (rest_for_one)
-    ├── Registry            — ETS-backed 128-bit key → module atom mapping
-    ├── DynamicSupervisor   — starts/stops Worker processes on demand
-    └── Loader              — GenServer tracking loaded modules in ETS
-        └── Worker(s)       — one GenServer per loaded module
+SetmyInfo.ElixirModuleLoader.Supervisor (rest_for_one)
+├── Registry       — ETS-backed 128-bit key → module atom mapping
+├── Loader         — GenServer tracking the loaded working set in ETS
+└── CompileLock    — serialises compilations (VM-global flag safety)
 ```
 
-The `:rest_for_one` strategy means:
-- Registry crash → DynamicSupervisor + Loader restart (ETS rebuilt, Workers terminated)
-- DynamicSupervisor crash → Loader restarts and reconciles with surviving Workers
-- Loader crash → only Loader restarts; Workers survive, Loader reconciles from WorkerRegistry
+`:rest_for_one` restarts all children that come after the crashed one:
 
-## Concurrency & safety guarantees
+- Registry crash → Loader + CompileLock restart (ETS tables rebuilt)
+- Loader crash → Loader + CompileLock restart (working set re-tracked by the user; CompileLock is stateless)
+- CompileLock crash → only CompileLock restarts
 
-| Operation                          | Guarantee                                                                                                   |
-|------------------------------------|-------------------------------------------------------------------------------------------------------------|
-| `compile/1`, `compile_file/1`      | Serialised through the dedicated CompileLock GenServer — the VM-global compiler flag is never toggled by two callers at once, its previous value is restored, and a slow compile never blocks registry writes |
-| `load_beam_file/1`, `load_beam_binary/2` | Safe to call concurrently — go straight to the VM code server, which is itself serialised               |
-| `register/2`, `register_file/2`, `unregister/1`, `register_many/1` | Writes serialised through the Registry GenServer; `register_many/1` validates every spec before inserting. UUID strings are converted to keys before dispatch |
-| `lookup/1`, `registered?/1`        | Lock-free O(1) ETS reads, safe for many concurrent readers                                                  |
-| `load/1`, `reload/1`, `release/1`  | Mutations serialised through the Loader GenServer; `load/1` is idempotent across concurrent callers          |
-| `loaded?/1`, `pid_for/1`           | Lock-free ETS reads; kept honest by Worker monitoring (see below)                                           |
-| `execute/3,4`                      | A plugin that raises returns `{:error, {:plugin_error, _}}`; one that exceeds the call timeout returns `{:error, :timeout}`; a Worker killed mid-call returns `{:error, :not_loaded}` — the caller never crashes |
+## Concurrency
 
-**Worker monitoring & self-healing.** The Loader monitors every Worker it
-starts. If a Worker dies outside of `release/1`, the Loader removes its stale
-tracking entry, so `loaded?/1` and `pid_for/1` stop reporting a dead PID. Workers
-are `restart: :temporary`, so a crashed Worker is not silently respawned under a
-new PID the Loader doesn't know about.
+| Operation | Guarantee |
+|---|---|
+| `compile/1,2`, `compile_file/1,2` | Serialised through CompileLock — VM-global flag never toggled by two callers at once |
+| `load/1`, `release/1`, `load_binary/3`, `load_source/2`, `load_file/2` | Mutations serialised through Loader GenServer; `load/1` is idempotent across concurrent callers |
+| `loaded?/1` | Lock-free O(1) ETS read — safe for any number of concurrent readers |
+| `functions/1`, `get_function/3` | Lock-free ETS read when already loaded; one GenServer call on first load |
 
-> **Caveat — dead-PID window.** Between a Worker dying and the Loader
-> processing its `:DOWN` message there is a brief window where `loaded?/1`
-> returns `true` and `pid_for/1` returns a PID that is no longer alive.
-> `execute/3,4` tolerates this (it returns `{:error, :not_loaded}`), but code
-> using `pid_for/1` directly must be prepared for the PID to be dead.
+Two caveats worth knowing:
 
-> **Caveat — `run_and_release/3` on the same key.** This shortcut assumes the
-> caller owns the key for the duration of the call. Two processes calling
-> `run_and_release/3` (or `release/1`) on the *same* key concurrently can race:
-> one may release the Worker out from under the other, which then sees
-> `{:error, :not_loaded}`. For shared keys, coordinate access or use distinct
-> keys per caller.
+- **Cold loads are serialised through the Loader.** When a key's code must be
+  restored (recompile a `.ex`, reload a `.beam`/binary after a release), the
+  restore runs inside the Loader GenServer and may take up to 60 seconds.
+  Cold loads of *different* keys do not run in parallel. Already-loaded keys
+  are unaffected (lock-free read).
+- **Do not use and release the same key from different processes at once.**
+  `release/1` can purge a module's code between the moment another process
+  obtains the module and the moment it calls a function on it, raising
+  `:undef`. Acquire and use a function within a single load → use → release
+  lifecycle. Reference counting only protects a module shared across
+  *different* keys, not concurrent use-and-release of the *same* key.
 
 ## Development commands
 
@@ -326,18 +501,11 @@ mix report             # docs + test.coverage + deps.audit
 ### 1 — Create account and authenticate
 
 ```bash
-# Register a new account (one-time)
-mix hex.user register
-
-# Or authenticate an existing account on a new machine
-mix hex.user auth
+mix hex.user register   # new account (one-time)
+mix hex.user auth       # authenticate on a new machine
 ```
 
-Mix stores an encrypted local key; you do not need to log in again on the same machine.
-
 ### 2 — Verify package metadata in mix.exs
-
-The `package/0` section controls what hex.pm displays and what files are shipped:
 
 ```elixir
 defp package do
@@ -351,131 +519,35 @@ defp package do
 end
 ```
 
-Also confirm the top-level `project/0` fields:
-
-| Field         | Purpose                        |
-|---------------|--------------------------------|
-| `version`     | SemVer string, e.g. `"0.1.0"`  |
-| `description` | Short one-sentence description |
-| `source_url`  | GitHub URL (shown on hex.pm)   |
-
-### 3 — Generate API documentation
-
-```bash
-mix deps.get
-mix docs
-```
-
-Docs are written to `_build/doc/`. Hex.pm serves them automatically at
-`hexdocs.pm/elixir_module_loader` after publish.
-
-### 4 — Dry-run (preview only)
+### 3 — Dry-run (preview only)
 
 ```bash
 mix hex.publish --dry-run
 ```
 
-Verify: correct version, correct file list (only `lib/`, `mix.exs`,
-`README.md`, `LICENSE`), no sensitive files included.
-
-### 5 — Publish locally
-
-**Option A — interactive (Mix prompts for your hex.pm password):**
+### 4 — Publish
 
 ```bash
 mix hex.publish
+# or with an API key:
+HEX_API_KEY=<your-key> mix hex.publish --yes
 ```
 
-**Option B — using an API key (same key as CI, no password prompt):**
+After publish the package is live at:
+- https://hex.pm/packages/elixir_module_loader
+- https://hexdocs.pm/elixir_module_loader
 
-```bash
-HEX_API_KEY=<your-key> mix hex.publish --organization setmy_info --yes
-```
+### 5 — Publish a new version
 
-Replace `<your-key>` with the key from hex.pm → Account settings → API Keys
-(must be an organization key with write access to `setmy_info`).
-The `--yes` flag skips the confirmation prompt, matching CI behaviour.
-Using the API key is recommended when you want to test the exact same
-authentication path that GitHub Actions uses before pushing to master.
-
-Mix will build a tarball, upload docs to hexdocs.pm, and push to hex.pm.
-After confirmation, the package is live at:
-
-```
-https://hex.pm/packages/elixir_module_loader
-https://hexdocs.pm/elixir_module_loader
-```
-
-### 6 — Publish a new version
-
-1. Bump `version` in `mix.exs` following SemVer.
+1. Bump `version` in `mix.exs`.
 2. Update this README if the public API changed.
 3. Run `mix hex.publish`.
 
-Hex.pm does **not** allow overwriting a published version. Use a new version
-number for every release.
+### 6 — CI auto-publish (GitHub Actions)
 
-### 7 — Retire a version
-
-```bash
-mix hex.retire elixir_module_loader 0.1.0 security --message "Use 0.1.1 instead"
-```
-
-Retiring warns users without removing the version (existing users are not broken).
-
-### 8 — Adding as a dependency
-
-```elixir
-{:elixir_module_loader, "~> 1.0"}
-```
-
-### CI auto-publish (GitHub Actions)
-
-The publish job needs a `HEX_API_KEY` repository secret. If it is absent
-(the CI publish step fails with an authentication error or reports
-`HEX_API_KEY: NOT SET or empty`), add it as follows:
-
-1. Generate a CI-specific key (separate from your personal key):
-
-   ```bash
-   mix hex.user key generate --key-name github-ci
-   ```
-
-   For an organization package, generate an organization key instead:
-
-   ```bash
-   mix hex.organization key generate setmy_info --key-name github-ci
-   ```
-
-2. Copy the key printed to the terminal — it is shown only once.
-3. On GitHub, open the repository page and go to
-   **Settings → Secrets and variables → Actions**.
-4. On the **Secrets** tab, click **New repository secret**.
-5. Set **Name** to `HEX_API_KEY`, paste the key into **Secret**,
-   and click **Add secret**.
-
-The workflow reads it via `${{ secrets.HEX_API_KEY }}`; no further
-configuration is needed. To replace a leaked or rotated key, repeat the
-steps and use **Update** on the existing secret.
-
-Add a publish job to `.github/workflows/ci.yml`:
-
-```yaml
-  publish:
-      needs: test
-      runs-on: ubuntu-latest
-      if: github.ref == 'refs/heads/master' && github.event_name == 'push'
-      steps:
-          -   uses: actions/checkout@v4
-          -   uses: erlef/setup-beam@v1
-              with:
-                  otp-version: "29.x"
-                  elixir-version: "1.19.x"
-          -   run: mix deps.get
-          -   run: mix hex.publish --yes
-              env:
-                  HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
-```
+Add `HEX_API_KEY` as a repository secret (Settings → Secrets → Actions),
+then the publish job in `.github/workflows/ci.yml` runs automatically on
+pushes to master.
 
 ---
 

@@ -1,84 +1,115 @@
 defmodule SetmyInfo.ElixirModuleLoader.E2E.UUIDFlowTest do
   @moduledoc """
-  End-to-end test of the UUID-facing API: a Library user generates a UUID,
-  registers a module file under it, then loads / requests / releases by UUID.
-  Also verifies UUID and 128-bit forms address the same registry entry.
+  End-to-end test of UUID/key interchangeability: compile assigns a 128-bit
+  key; `key_to_uuid/1` converts it to a UUID string; both forms address the
+  same registry entry for load, release, and function discovery.
   """
 
   use ExUnit.Case, async: false
 
   alias SetmyInfo.ElixirModuleLoader, as: ML
-  alias SetmyInfo.ElixirModuleLoader.UUID
+  alias SetmyInfo.ElixirModuleLoader.{Registry, UUID}
 
   @fixture_path Path.expand("../fixtures/sample_module.ex", __DIR__)
   @module SetmyInfo.ElixirModuleLoader.Support.SampleModule
 
-  describe "register_file/2 + UUID lifecycle" do
-    setup do
-      uuid = ML.generate_uuid()
+  describe "binary key and UUID string are interchangeable" do
+    test "compile returns a binary key; key_to_uuid converts it to UUID" do
+      {:ok, key, _module} = ML.compile_file(@fixture_path)
+      uuid = ML.key_to_uuid(key)
 
-      on_exit(fn ->
-        if ML.loaded?(uuid), do: ML.release(uuid)
-        ML.unregister(uuid)
-      end)
-
-      {:ok, uuid: uuid}
-    end
-
-    test "register a .ex file, then request and release by UUID", %{uuid: uuid} do
-      assert {:ok, @module} = ML.register_file(uuid, @fixture_path)
-      assert ML.registered?(uuid)
-
-      assert {:ok, _pid} = ML.load(uuid)
-      assert ML.loaded?(uuid)
-      assert {:ok, 5} = ML.execute(uuid, :add, [2, 3])
-
-      assert :ok = ML.release(uuid)
-      refute ML.loaded?(uuid)
-    end
-
-    test "run_and_release/3 by UUID", %{uuid: uuid} do
-      {:ok, @module} = ML.register_file(uuid, @fixture_path)
-      refute ML.loaded?(uuid)
-      assert {:ok, 12} = ML.run_and_release(uuid, :multiply, [3, 4])
-      refute ML.loaded?(uuid)
-    end
-  end
-
-  describe "UUID and 128-bit forms are interchangeable" do
-    test "register by UUID, look up / execute by its binary key" do
-      uuid = ML.generate_uuid()
-      key = UUID.to_key!(uuid)
+      assert byte_size(key) == 16
+      assert String.length(uuid) == 36
+      assert UUID.to_key!(uuid) == key
 
       on_exit(fn ->
         if ML.loaded?(key), do: ML.release(key)
-        ML.unregister(key)
+        Registry.unregister(key)
       end)
-
-      {:ok, @module} = ML.register_file(uuid, @fixture_path)
-
-      # Looked up by the binary form of the same id.
-      assert {:ok, @module} = ML.lookup(key)
-      assert ML.registered?(key)
-
-      {:ok, _pid} = ML.load(key)
-      assert {:ok, 7} = ML.execute(key, :add, [3, 4])
     end
 
-    test "register by binary key, release by UUID" do
-      key = ML.generate_key()
-      uuid = UUID.from_key(key)
+    test "load/1 accepts both key and UUID for the same entry" do
+      {:ok, key, _module} = ML.compile_file(@fixture_path)
+      uuid = ML.key_to_uuid(key)
 
       on_exit(fn ->
-        if ML.loaded?(uuid), do: ML.release(uuid)
-        ML.unregister(uuid)
+        if ML.loaded?(key), do: ML.release(key)
+        Registry.unregister(key)
       end)
 
-      :ok = ML.register(key, @module)
-      {:ok, _pid} = ML.load(uuid)
+      {:ok, m1} = ML.load(key)
+      {:ok, m2} = ML.load(uuid)
+      assert m1 == m2
+      assert m1 == @module
+    end
+
+    test "loaded?/1 reports the same state via both forms" do
+      {:ok, key, _module} = ML.compile_file(@fixture_path)
+      uuid = ML.key_to_uuid(key)
+
+      on_exit(fn ->
+        if ML.loaded?(key), do: ML.release(key)
+        Registry.unregister(key)
+      end)
+
       assert ML.loaded?(key)
-      assert :ok = ML.release(uuid)
+      assert ML.loaded?(uuid)
+
+      ML.release(uuid)
       refute ML.loaded?(key)
+      refute ML.loaded?(uuid)
+    end
+
+    test "release by UUID removes the entry tracked under the binary key" do
+      {:ok, key, module} = ML.compile_file(@fixture_path)
+      uuid = ML.key_to_uuid(key)
+
+      on_exit(fn ->
+        if ML.loaded?(key), do: ML.release(key)
+        Registry.unregister(key)
+      end)
+
+      assert 5 == module.add(2, 3)
+      assert ML.loaded?(key)
+
+      :ok = ML.release(uuid)
+      refute ML.loaded?(key)
+    end
+
+    test "functions/1 works with UUID string" do
+      {:ok, key, _module} = ML.compile_file(@fixture_path)
+      uuid = ML.key_to_uuid(key)
+
+      on_exit(fn ->
+        if ML.loaded?(key), do: ML.release(key)
+        Registry.unregister(key)
+      end)
+
+      {:ok, exports} = ML.functions(uuid)
+      assert {:add, 2} in exports
+      assert {:multiply, 2} in exports
+    end
+  end
+
+  describe "generate_uuid workflow" do
+    test "a UUID generated upfront can address a compiled module" do
+      uuid = ML.generate_uuid()
+      key = UUID.to_key!(uuid)
+
+      {:ok, compiled_key, _module} = ML.compile_file(@fixture_path)
+      compiled_uuid = ML.key_to_uuid(compiled_key)
+
+      on_exit(fn ->
+        if ML.loaded?(compiled_key), do: ML.release(compiled_key)
+        Registry.unregister(compiled_key)
+      end)
+
+      assert is_binary(uuid)
+      assert byte_size(key) == 16
+      assert String.length(compiled_uuid) == 36
+
+      {:ok, m} = ML.load(compiled_uuid)
+      assert 7 == m.add(3, 4)
     end
   end
 end

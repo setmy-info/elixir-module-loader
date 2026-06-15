@@ -2,10 +2,9 @@ defmodule SetmyInfo.ElixirModuleLoader.Application do
   @moduledoc """
   OTP Application entry point for SetmyInfo.ElixirModuleLoader.
 
-  Starts a Registry for named worker lookup, then the main Supervisor
-  which owns the DynamicSupervisor (for Worker processes), the module
-  Registry (128-bit key → module atom), and the Loader (tracks loaded
-  modules via ETS).
+  Starts the main Supervisor which owns the module Registry (128-bit key →
+  module/meta), the Loader (loaded working set + code memory management), and
+  the CompileLock (serialised runtime compilation).
   """
 
   use Application
@@ -13,7 +12,6 @@ defmodule SetmyInfo.ElixirModuleLoader.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      {Registry, keys: :unique, name: SetmyInfo.ElixirModuleLoader.WorkerRegistry},
       SetmyInfo.ElixirModuleLoader.Supervisor
     ]
 

@@ -1,0 +1,14 @@
+# Sobelow configuration — read by `mix sobelow --config` (the `mix security` alias).
+#
+# `skip: true` makes Sobelow honour inline `# sobelow_skip [...]` annotations.
+# The only annotation in this project is on `SetmyInfo.Modules.compile/1`, where
+# the `File.write!` path is built from a UUID validated against path traversal
+# and a compiler-produced module atom — see the comment there and the
+# path-traversal tests in test/unit/setmy_info/modules_test.exs.
+[
+  verbose: false,
+  private: false,
+  skip: true,
+  ignore: [],
+  ignore_files: []
+]

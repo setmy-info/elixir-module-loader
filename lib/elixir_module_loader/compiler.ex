@@ -39,8 +39,8 @@ defmodule SetmyInfo.ElixirModuleLoader.Compiler do
 
   The BEAM supports two live versions of any module simultaneously.
   Calling any `from_*` function while the module is already loaded performs
-  a hot swap: existing Worker processes pick up the new code on their next
-  call without a restart.
+  a hot swap: existing processes calling the module pick up the new code on
+  their next call without a restart.
   """
 
   alias SetmyInfo.ElixirModuleLoader.CompileLock

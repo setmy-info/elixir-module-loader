@@ -3,14 +3,13 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderContext do
 
   import ExUnit.Assertions
 
+  alias SetmyInfo.ElixirModuleLoader, as: EML
+  alias SetmyInfo.ElixirModuleLoader.Registry
   alias WhiteBread.Context.StepFunction
 
   @source """
   defmodule SetmyInfo.ElixirModuleLoader.BDD.AddPlugin do
-    @behaviour SetmyInfo.ElixirModuleLoader.Behaviour
-    def name, do: :bdd_add_plugin
-    def execute(:add, [a, b]), do: {:ok, a + b}
-    def execute(f, _), do: {:error, {:undefined_function, f}}
+    def add(a, b), do: a + b
   end
   """
 
@@ -40,7 +39,14 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderContext do
   def scenario_starting_state(state), do: state
 
   @impl WhiteBread.ContextBehaviour
-  def scenario_finalize(_status, _state), do: nil
+  def scenario_finalize(_status, state) do
+    with %{key: key} <- state do
+      if EML.loaded?(key), do: EML.release(key)
+      Registry.unregister(key)
+    end
+
+    nil
+  end
 
   @impl WhiteBread.ContextBehaviour
   def feature_finalize(_status, _state), do: nil
@@ -49,44 +55,37 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderContext do
   def get_scenario_timeout(_feature, _scenario), do: 30_000
 
   def step_module_loader_running(state, _extra) do
-    {:ok, _} = SetmyInfo.ElixirModuleLoader.compile(@source)
-    key = SetmyInfo.ElixirModuleLoader.generate_key()
-    :ok = SetmyInfo.ElixirModuleLoader.register(key, SetmyInfo.ElixirModuleLoader.BDD.AddPlugin)
-    {:ok, Map.merge(state, %{key: key, result: nil})}
+    {:ok, key, _module} = EML.compile(@source)
+    {:ok, Map.merge(state, %{key: key, module: nil, result: nil})}
   end
 
   def step_load_module(state, _extra) do
-    {:ok, _pid} = SetmyInfo.ElixirModuleLoader.load(state.key)
-    {:ok, state}
+    {:ok, module} = EML.load(state.key)
+    {:ok, %{state | module: module}}
   end
 
   def step_execute_add(state, %{a: a, b: b}) do
-    result =
-      SetmyInfo.ElixirModuleLoader.execute(state.key, :add, [
-        String.to_integer(a),
-        String.to_integer(b)
-      ])
-
+    result = apply(state.module, :add, [String.to_integer(a), String.to_integer(b)])
     {:ok, Map.put(state, :result, result)}
   end
 
   def step_result_should_be(state, %{expected: expected}) do
-    assert {:ok, String.to_integer(expected)} == state.result
+    assert String.to_integer(expected) == state.result
     {:ok, state}
   end
 
   def step_module_should_be_loaded(state, _extra) do
-    assert SetmyInfo.ElixirModuleLoader.loaded?(state.key)
+    assert EML.loaded?(state.key)
     {:ok, state}
   end
 
   def step_release_module(state, _extra) do
-    :ok = SetmyInfo.ElixirModuleLoader.release(state.key)
+    :ok = EML.release(state.key)
     {:ok, state}
   end
 
   def step_module_should_not_be_loaded(state, _extra) do
-    refute SetmyInfo.ElixirModuleLoader.loaded?(state.key)
+    refute EML.loaded?(state.key)
     {:ok, state}
   end
 end

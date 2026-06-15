@@ -1,48 +1,46 @@
 defmodule SetmyInfo.ElixirModuleLoader.Loader do
   @moduledoc """
-  GenServer managing the lifecycle of runtime module Workers.
+  GenServer tracking the loaded working set and managing code memory.
 
-  ## Responsibilities
+  The library does not wrap calls in any process: `load/1` makes the module's
+  code available in the VM and returns the **module itself** — the caller
+  invokes its functions directly (`module.fun(args)` or `apply/3`). What this
+  GenServer owns is the bookkeeping around that:
 
-  * **Load on demand** — starts a Worker under DynamicSupervisor when a key is
-    first requested; subsequent `load/1` calls return the existing PID (idempotent).
-  * **Release** — terminates the Worker and removes the ETS entry.
-  * **Reload** — terminates any running Worker and starts a fresh one; useful
-    after a hot code swap where Worker state also needs resetting.
-  * **Self-healing** — the Loader monitors every Worker it starts. If a Worker
-    dies outside of `release/1` (e.g. it is killed, or its supervisor restarts
-    it), the `:DOWN` message removes the stale ETS entry so `loaded?/1` and
-    `pid_for/1` never report a dead PID.
-  * **Crash recovery** — on restart, reconciles its ETS table from the live
-    WorkerRegistry so orphaned Workers are re-tracked (and re-monitored)
-    immediately.
+  * **Load on demand** — restores the module's code from the registry's
+    `beam_source` if it is not in the VM (e.g. after an earlier release),
+    marks the key as loaded, returns the module. Idempotent.
+  * **Release** — removes the key from the working set and — when the code is
+    library-managed (`beam_source` present) and no other loaded key uses the
+    same module — deletes and soft-purges the module's code from the VM, so
+    releasing frees code memory.
+  * **Reload** — re-restores the code from its source (recompiles a `.ex`,
+    reloads a `.beam`/binary), hot-swapping the running version.
 
   ## Concurrency
 
-  ETS is `:protected` — `loaded?/1`, `list_loaded/0`, and `pid_for/1` read it
-  from any process without touching the GenServer mailbox (O(1)), while only
-  the Loader process itself can write. All mutations go through
+  ETS is `:protected` — `loaded?/1`, `module_for/1`, and `list_loaded/0` read
+  it from any process without touching the GenServer mailbox (O(1)), while
+  only the Loader process itself can write. All mutations go through
   `GenServer.call` to ensure serialisation and atomicity.
-
-  > #### Dead-PID window {: .warning}
-  >
-  > Between a Worker dying and the Loader processing its `:DOWN` message there
-  > is a brief window where `loaded?/1` returns `true` and `pid_for/1` returns
-  > a PID that is no longer alive. `Worker.execute/4` tolerates this (it
-  > returns `{:error, :not_loaded}` on `:noproc`), but callers using
-  > `pid_for/1` directly must be prepared for the PID to be dead.
 
   ## Lifecycle
 
-      load(key)    → looks up Registry, starts Worker, inserts {key, pid} into ETS
-      reload(key)  → terminates old Worker (if any), starts fresh one
-      release(key) → terminates Worker, deletes ETS entry
+      load(key)    → restores code if purged, tracks {key, module}, returns module
+      reload(key)  → forces a code re-restore (hot swap), returns module
+      release(key) → drops tracking, purges unused library-managed code
   """
 
   use GenServer
   require Logger
 
+  alias SetmyInfo.ElixirModuleLoader.{Compiler, Registry}
+
   @table :elixir_module_loader_loaded
+
+  # Loading may trigger a code restore that recompiles a source file, so the
+  # call timeout must comfortably exceed normal compilation time.
+  @load_timeout 60_000
 
   # ── Public API ────────────────────────────────────────────────────────────
 
@@ -50,22 +48,34 @@ defmodule SetmyInfo.ElixirModuleLoader.Loader do
     GenServer.start_link(__MODULE__, init_arg, name: __MODULE__)
   end
 
-  @spec load(<<_::128>>) :: {:ok, pid()} | {:error, term()}
+  @doc """
+  Load the entry registered under `key`: make its code available in the VM
+  (restoring it from the registered source if needed) and return the module.
+  Idempotent — loading a loaded key returns the same module.
+  """
+  @spec load(<<_::128>>) :: {:ok, module()} | {:error, term()}
   def load(<<_::128>> = key) do
-    GenServer.call(__MODULE__, {:load, key})
+    case module_for(key) do
+      {:ok, module} -> {:ok, module}
+      {:error, :not_loaded} -> GenServer.call(__MODULE__, {:load, key}, @load_timeout)
+    end
   end
 
   @doc """
-  Reload: terminate the running Worker (if any) and start a fresh one.
-
-  Use after `Compiler.from_source/1` when Worker state also needs resetting.
-  If the key is not currently loaded, this behaves identically to `load/1`.
+  Re-restore the module's code from its registered source — recompile the
+  `.ex`, reload the `.beam` file or binary — hot-swapping the loaded version.
+  Loads the key if it was not loaded.
   """
-  @spec reload(<<_::128>>) :: {:ok, pid()} | {:error, term()}
+  @spec reload(<<_::128>>) :: {:ok, module()} | {:error, term()}
   def reload(<<_::128>> = key) do
-    GenServer.call(__MODULE__, {:reload, key})
+    GenServer.call(__MODULE__, {:reload, key}, @load_timeout)
   end
 
+  @doc """
+  Release the key: remove it from the loaded working set and purge the
+  module's code from the VM when it is library-managed and no other loaded
+  key still uses it.
+  """
   @spec release(<<_::128>>) :: :ok | {:error, :not_loaded}
   def release(<<_::128>> = key) do
     GenServer.call(__MODULE__, {:release, key})
@@ -79,17 +89,27 @@ defmodule SetmyInfo.ElixirModuleLoader.Loader do
     end
   end
 
-  @spec pid_for(<<_::128>>) :: {:ok, pid()} | {:error, :not_loaded}
-  def pid_for(<<_::128>> = key) do
+  @doc "The module a loaded key resolves to, without loading it."
+  @spec module_for(<<_::128>>) :: {:ok, module()} | {:error, :not_loaded}
+  def module_for(<<_::128>> = key) do
     case :ets.lookup(@table, key) do
-      [{^key, pid}] -> {:ok, pid}
+      [{^key, module, _loaded_at}] -> {:ok, module}
+      [] -> {:error, :not_loaded}
+    end
+  end
+
+  @doc "When the key was loaded, for external usage trackers."
+  @spec loaded_at(<<_::128>>) :: {:ok, DateTime.t()} | {:error, :not_loaded}
+  def loaded_at(<<_::128>> = key) do
+    case :ets.lookup(@table, key) do
+      [{^key, _module, loaded_at}] -> {:ok, loaded_at}
       [] -> {:error, :not_loaded}
     end
   end
 
   @spec list_loaded() :: [<<_::128>>]
   def list_loaded do
-    :ets.tab2list(@table) |> Enum.map(fn {key, _pid} -> key end)
+    :ets.tab2list(@table) |> Enum.map(fn {key, _module, _loaded_at} -> key end)
   end
 
   # ── GenServer callbacks ───────────────────────────────────────────────────
@@ -97,97 +117,48 @@ defmodule SetmyInfo.ElixirModuleLoader.Loader do
   @impl true
   def init(_init_arg) do
     :ets.new(@table, [:named_table, :protected, :set, read_concurrency: true])
-    monitors = reconcile_with_worker_registry()
-    {:ok, %{monitors: monitors}}
+    {:ok, %{}}
   end
 
   @impl true
   def handle_call({:load, key}, _from, state) do
     case :ets.lookup(@table, key) do
-      [{^key, pid}] ->
-        {:reply, {:ok, pid}, state}
+      [{^key, module, _t}] ->
+        {:reply, {:ok, module}, state}
 
       [] ->
-        case start_worker(key) do
-          {:ok, pid} = ok -> {:reply, ok, monitor_worker(state, key, pid)}
-          error -> {:reply, error, state}
-        end
+        {:reply, do_load(key, _force_restore = false), state}
     end
   end
 
   @impl true
   def handle_call({:reload, key}, _from, state) do
-    state = terminate_worker(key, state)
-
-    case start_worker(key) do
-      {:ok, pid} = ok -> {:reply, ok, monitor_worker(state, key, pid)}
-      error -> {:reply, error, state}
-    end
+    {:reply, do_load(key, _force_restore = true), state}
   end
 
   @impl true
   def handle_call({:release, key}, _from, state) do
     case :ets.lookup(@table, key) do
-      [{^key, _pid}] ->
-        {:reply, :ok, terminate_worker(key, state)}
+      [{^key, module, _t}] ->
+        :ets.delete(@table, key)
+        Logger.info("[Loader] released #{Base.encode16(key)} (#{inspect(module)})")
+        maybe_purge(key, module)
+        {:reply, :ok, state}
 
       [] ->
         {:reply, {:error, :not_loaded}, state}
     end
   end
 
-  @impl true
-  def handle_info({:DOWN, _ref, :process, pid, reason}, state) do
-    case Map.pop(state.monitors, pid) do
-      {{key, _ref}, monitors} ->
-        # Worker died outside of release/1 — drop the stale ETS entry so
-        # loaded?/1 and pid_for/1 stop reporting a dead PID.
-        :ets.match_delete(@table, {key, pid})
-
-        Logger.warning(
-          "[Loader] worker #{Base.encode16(key)} (#{inspect(pid)}) went down " <>
-            "(#{inspect(reason)}); cleaned up tracking"
-        )
-
-        {:noreply, %{state | monitors: monitors}}
-
-      {nil, _monitors} ->
-        {:noreply, state}
-    end
-  end
-
   # ── Private ───────────────────────────────────────────────────────────────
 
-  defp start_worker(key) do
-    case SetmyInfo.ElixirModuleLoader.Registry.lookup(key) do
-      {:ok, impl_module} ->
-        case DynamicSupervisor.start_child(
-               SetmyInfo.ElixirModuleLoader.DynamicSupervisor,
-               {SetmyInfo.ElixirModuleLoader.Worker, {key, impl_module}}
-             ) do
-          {:ok, pid} ->
-            :ets.insert(@table, {key, pid})
-
-            Logger.info(
-              "[Loader] loaded #{Base.encode16(key)} via #{inspect(impl_module)} (#{inspect(pid)})"
-            )
-
-            {:ok, pid}
-
-          {:error, {:already_started, pid}} ->
-            # A Worker is already registered under this key's via-name (e.g. a
-            # survivor that was reconciled, or a concurrent reload). Adopt it.
-            :ets.insert(@table, {key, pid})
-
-            Logger.info(
-              "[Loader] adopted already-started worker #{Base.encode16(key)} (#{inspect(pid)})"
-            )
-
-            {:ok, pid}
-
-          {:error, reason} = error ->
-            Logger.warning("[Loader] failed to load #{Base.encode16(key)}: #{inspect(reason)}")
-            error
+  defp do_load(key, force_restore) do
+    case Registry.lookup_entry(key) do
+      {:ok, module, meta} ->
+        with :ok <- ensure_code_loaded(module, meta, force_restore) do
+          :ets.insert(@table, {key, module, DateTime.utc_now()})
+          Logger.info("[Loader] loaded #{Base.encode16(key)} → #{inspect(module)}")
+          {:ok, module}
         end
 
       {:error, :not_found} = error ->
@@ -196,53 +167,54 @@ defmodule SetmyInfo.ElixirModuleLoader.Loader do
     end
   end
 
-  defp terminate_worker(key, state) do
-    case :ets.lookup(@table, key) do
-      [{^key, pid}] ->
-        state = demonitor_worker(state, pid)
-        DynamicSupervisor.terminate_child(SetmyInfo.ElixirModuleLoader.DynamicSupervisor, pid)
-        :ets.delete(@table, key)
-        Logger.info("[Loader] released #{Base.encode16(key)} (#{inspect(pid)})")
-        state
-
-      [] ->
-        state
+  defp ensure_code_loaded(module, meta, force) do
+    if not force and :code.is_loaded(module) != false do
+      :ok
+    else
+      restore_code(module, meta[:beam_source])
     end
   end
 
-  defp monitor_worker(state, key, pid) do
-    ref = Process.monitor(pid)
-    %{state | monitors: Map.put(state.monitors, pid, {key, ref})}
+  defp restore_code(_module, nil), do: :ok
+
+  defp restore_code(module, {:binary, beam}),
+    do: Compiler.from_beam_binary(module, beam)
+
+  defp restore_code(module, {:file, path}) do
+    with {:ok, ^module} <- Compiler.from_beam_file(path), do: :ok
   end
 
-  defp demonitor_worker(state, pid) do
-    case Map.pop(state.monitors, pid) do
-      {{_key, ref}, monitors} ->
-        # Flush so we never act on a :DOWN for a Worker we deliberately stopped.
-        Process.demonitor(ref, [:flush])
-        %{state | monitors: monitors}
-
-      {nil, _monitors} ->
-        state
+  defp restore_code(module, {:ex_file, path}) do
+    with {:ok, modules} <- Compiler.from_file(path) do
+      if List.keymember?(modules, module, 0),
+        do: :ok,
+        else: {:error, {:module_not_in_file, module, path}}
     end
   end
 
-  defp reconcile_with_worker_registry do
-    entries =
-      Registry.select(SetmyInfo.ElixirModuleLoader.WorkerRegistry, [
-        {{:"$1", :"$2", :_}, [], [{{:"$1", :"$2"}}]}
-      ])
+  # Releasing must also free the module's code memory (requirements):
+  # when the code is library-managed (beam_source present — i.e. restorable)
+  # and no other loaded key still uses the same module, delete + soft-purge it.
+  # Registered-but-unloaded keys are safe: their next load restores the code.
+  defp maybe_purge(key, module) do
+    with {:ok, ^module, %{beam_source: source}} when not is_nil(source) <-
+           Registry.lookup_entry(key),
+         [] <- :ets.match(@table, {:"$1", module, :_}) do
+      # Clear any stale old version first (hot swaps leave one behind),
+      # otherwise :code.delete refuses to retire the current version.
+      Compiler.purge(module)
+      Compiler.delete(module)
 
-    if entries != [] do
-      :ets.insert(@table, entries)
+      unless Compiler.purge(module) do
+        Logger.warning(
+          "[Loader] soft purge of #{inspect(module)} skipped — " <>
+            "processes still running its old code"
+        )
+      end
 
-      Logger.info(
-        "[Loader] reconciled #{length(entries)} surviving Worker(s) from WorkerRegistry"
-      )
+      Logger.info("[Loader] purged code of #{inspect(module)} after release")
+    else
+      _ -> :ok
     end
-
-    Map.new(entries, fn {key, pid} ->
-      {pid, {key, Process.monitor(pid)}}
-    end)
   end
 end
