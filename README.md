@@ -282,6 +282,26 @@ request = %Request{uuid: uuid, file_name: "Masker.ex"}
 
 Both `:uuid` and `:file_name` are required fields.
 
+### Path safety
+
+`uuid` and `file_name` arrive from external systems, so both are validated
+before any path is built — a caller-supplied value can never escape the
+configured root path:
+
+- `uuid` must be a well-formed UUID string. Any other value — including one
+  containing `/` or `..` — is rejected with `{:error, :invalid_uuid}`. This is
+  enforced wherever a path is built: `uuid_path/1`, `module_path/1`,
+  `compile/1`, and `load/1`.
+- `file_name` must be a plain file name inside the UUID folder — no directory
+  separators and no `.`/`..` segments — otherwise `{:error, :invalid_file_name}`.
+  This is enforced wherever `file_name` is used to build a path:
+  `module_path/1` and `compile/1`.
+
+```elixir
+Modules.uuid_path("../../etc")                                  #=> {:error, :invalid_uuid}
+Modules.module_path(%Request{uuid: uuid, file_name: "../x.ex"}) #=> {:error, :invalid_file_name}
+```
+
 ### Path helpers
 
 ```elixir
@@ -372,7 +392,7 @@ graph TD
         C["Compiler\nCode.compile_string / compile_file\n:code.load_binary / :code.load_abs\nsoft_purge · delete"]
 
         subgraph OTP["Supervisor  ·  rest_for_one"]
-            R["Registry  GenServer + ETS\nkey → module + meta + beam_source"]
+            R["Registry  GenServer + ETS\nkey → module + beam_source"]
             LD["Loader  GenServer + ETS\nkey → module + loaded_at\nref-counted purge / restore"]
             CL["CompileLock  GenServer\ncompile mutex"]
         end
