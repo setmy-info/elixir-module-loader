@@ -2,12 +2,12 @@ defmodule SetmyInfo.ElixirModuleLoader.Modules.Math do
   @moduledoc """
   Example built-in math module — a plain module, no interface required.
 
-  Register it under any key and call it directly:
+  Register it and discover its functions at runtime:
 
-      key = SetmyInfo.ElixirModuleLoader.generate_key()
-      SetmyInfo.ElixirModuleLoader.register(key, SetmyInfo.ElixirModuleLoader.Modules.Math)
-      {:ok, math} = SetmyInfo.ElixirModuleLoader.load(key)
-      5 = math.add(2, 3)
+      alias SetmyInfo.ElixirModuleLoader, as: EML
+      {:ok, key, _m} = EML.load_by_name(SetmyInfo.ElixirModuleLoader.Modules.Math)
+      {:ok, add_fn}  = EML.get_function(key, :add, 2)
+      5              = add_fn.([2, 3])
   """
 
   def add(a, b) when is_number(a) and is_number(b), do: a + b

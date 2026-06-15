@@ -1,28 +1,18 @@
 defmodule SetmyInfo.ElixirModuleLoader.Integration.UseCaseTest do
   @moduledoc """
-  Integration examples validating the use cases from PROMPT.md and
-  requirements.md (see VALIDATION.md for the full validation results):
-
-  * compile-on-demand for UUID-identified `.ex` source files (user logic)
-  * direct dynamic calls on loaded modules — no interface, names as data
-  * function composition across separately loaded modules — `result = f(g(data))`
-  * currying / partial application over loaded module functions
-  * map-shaped data flowing through dynamically loaded transformations
-
-  All assertions run against the live OTP supervision tree — no mocks.
+  Integration examples: the library compiles and loads modules, the caller
+  is fully responsible for discovering and invoking functions. No helpers,
+  no dispatch layer — direct `apply/3` or `module.fun/arity` calls.
   """
 
   use ExUnit.Case, async: false
 
   alias SetmyInfo.ElixirModuleLoader
+  alias SetmyInfo.ElixirModuleLoader.Registry
 
-  # ── UC: UUID-identified source file, compiled on demand ─────────────────────
-  #
-  # PROMPT.md: "If compiled file does not exist, need to check is source code
-  # existing, if exists need to compile and load it into memory. That part is
-  # library user software logic."
+  # ── UC: Compile on demand from file ─────────────────────────────────────────
 
-  describe "compile-on-demand for UUID-identified files" do
+  describe "compile-on-demand from a .ex file" do
     setup do
       dir = Path.join(System.tmp_dir!(), "eml_use_case_#{System.unique_integer([:positive])}")
       File.mkdir_p!(dir)
@@ -30,54 +20,48 @@ defmodule SetmyInfo.ElixirModuleLoader.Integration.UseCaseTest do
       {:ok, dir: dir}
     end
 
-    test "user code picks .beam when present, otherwise compiles the .ex source", %{dir: dir} do
-      uuid = ElixirModuleLoader.generate_uuid()
-      module_name = "UC1Plugin_" <> String.replace(uuid, "-", "_")
+    test "prefer .beam when present, otherwise compile the .ex source", %{dir: dir} do
+      source_path = Path.join(dir, "plugin.ex")
+      beam_path = Path.join(dir, "plugin.beam")
 
-      # The UUID identifies the module; the file name can be human readable.
-      File.write!(Path.join(dir, "double_plugin.ex"), """
-      defmodule #{module_name} do
+      File.write!(source_path, """
+      defmodule UC1Plugin do
         def double(x), do: x * 2
       end
       """)
 
-      # Library user logic: prefer the compiled artifact, fall back to source.
-      beam_path = Path.join(dir, "double_plugin.beam")
-      source_path = Path.join(dir, "double_plugin.ex")
       path = if File.exists?(beam_path), do: beam_path, else: source_path
+      {:ok, key, module} = ElixirModuleLoader.compile_file(path)
 
-      {:ok, module} = ElixirModuleLoader.register_file(uuid, path)
-      assert {:ok, ^module} = ElixirModuleLoader.lookup(uuid)
-
-      # The register call already returned the module — usable immediately.
       assert 42 == module.double(21)
 
-      ElixirModuleLoader.release(uuid)
-      ElixirModuleLoader.unregister(uuid)
+      ElixirModuleLoader.release(key)
+      Registry.unregister(key)
     end
   end
 
-  # ── UC: dynamic, abstract access — functions are not known in advance ───────
+  # ── UC: Dynamic access — functions not known in advance ─────────────────────
 
-  describe "dynamic access to unknown modules" do
+  describe "dynamic access to modules with unknown functions" do
     test "discover exports at runtime and call them as data" do
-      uuid = ElixirModuleLoader.generate_uuid()
-
-      {:ok, _module} =
-        ElixirModuleLoader.register_source(uuid, """
+      {:ok, key, _module} =
+        ElixirModuleLoader.compile("""
         defmodule UC2Mystery do
           def shout(s), do: String.upcase(s)
           def whisper(s), do: String.downcase(s)
         end
         """)
 
-      # The caller does not know the module: ask what it exports.
-      {:ok, exports} = ElixirModuleLoader.functions(uuid)
+      on_exit(fn ->
+        if ElixirModuleLoader.loaded?(key), do: ElixirModuleLoader.release(key)
+        Registry.unregister(key)
+      end)
+
+      {:ok, exports} = ElixirModuleLoader.functions(key)
       assert {:shout, 1} in exports
       assert {:whisper, 1} in exports
 
-      # Call every discovered arity-1 function dynamically.
-      {:ok, module} = ElixirModuleLoader.load(uuid)
+      {:ok, module} = ElixirModuleLoader.load(key)
 
       results =
         for {f, 1} <- exports, into: %{} do
@@ -86,17 +70,13 @@ defmodule SetmyInfo.ElixirModuleLoader.Integration.UseCaseTest do
 
       assert results == %{shout: "HEY", whisper: "hey"}
 
-      ElixirModuleLoader.release(uuid)
-      ElixirModuleLoader.unregister(uuid)
+      ElixirModuleLoader.release(key)
     end
   end
 
-  # ── UC: composition, chaining, currying across loaded modules ──────────────
-  #
-  # PROMPT.md: trimming comes from one module, "Bad" word removal from another,
-  # upcasing from a third — all compiled at runtime, composed as `f(g(data))`.
+  # ── UC: Manual composition across separately loaded modules ─────────────────
 
-  describe "function composition across dynamically loaded modules" do
+  describe "caller composes functions across dynamically loaded modules" do
     setup do
       specs =
         for {suffix, body} <- [
@@ -104,63 +84,84 @@ defmodule SetmyInfo.ElixirModuleLoader.Integration.UseCaseTest do
               {"Cleaner", ~S|def remove_bad(s), do: String.replace(s, "Bad ", "")|},
               {"Upcaser", "def upcase(s), do: String.upcase(s)"}
             ] do
-          uuid = ElixirModuleLoader.generate_uuid()
-
-          {:ok, _} =
-            ElixirModuleLoader.register_source(uuid, """
+          {:ok, key, _module} =
+            ElixirModuleLoader.compile("""
             defmodule UC3#{suffix} do
               #{body}
             end
             """)
 
-          uuid
+          key
         end
 
-      [trim, clean, up] = specs
+      [trim_key, clean_key, up_key] = specs
 
       on_exit(fn ->
-        for uuid <- specs do
-          if ElixirModuleLoader.loaded?(uuid), do: ElixirModuleLoader.release(uuid)
-          ElixirModuleLoader.unregister(uuid)
+        for key <- specs do
+          if ElixirModuleLoader.loaded?(key), do: ElixirModuleLoader.release(key)
+          Registry.unregister(key)
         end
       end)
 
-      {:ok, trim: trim, clean: clean, up: up}
+      {:ok, trim_key: trim_key, clean_key: clean_key, up_key: up_key}
     end
 
-    test "result = f(g(data)) — composition of captured first-class funs", ctx do
-      g = ElixirModuleLoader.fun(ctx.trim, :trim, 1)
-      f = ElixirModuleLoader.fun(ctx.up, :upcase, 1)
+    test "caller manually chains f(g(x)) across two loaded modules", ctx do
+      {:ok, trim_mod} = ElixirModuleLoader.load(ctx.trim_key)
+      {:ok, up_mod} = ElixirModuleLoader.load(ctx.up_key)
 
-      assert "HELLO" == f.(g.("   hello   "))
+      result = up_mod.upcase(trim_mod.trim("   hello   "))
+      assert "HELLO" == result
     end
 
-    test "three-stage pipeline: trim |> remove Bad |> upcase", ctx do
-      pipeline =
-        SetmyInfo.ElixirModuleLoader.Fn.pipe([
-          {ctx.trim, :trim},
-          {ctx.clean, :remove_bad},
-          {ctx.up, :upcase}
-        ])
+    test "caller pipes value through three loaded modules", ctx do
+      {:ok, trim_mod} = ElixirModuleLoader.load(ctx.trim_key)
+      {:ok, clean_mod} = ElixirModuleLoader.load(ctx.clean_key)
+      {:ok, up_mod} = ElixirModuleLoader.load(ctx.up_key)
 
-      assert "HELLO WORLD !!!" == pipeline.("   Hello Bad World !!!   ")
+      result =
+        "   Hello Bad World !!!   "
+        |> then(&trim_mod.trim/1)
+        |> then(&clean_mod.remove_bad/1)
+        |> then(&up_mod.upcase/1)
+
+      assert "HELLO WORLD !!!" == result
     end
 
     test "map-shaped data flows through a dynamically compiled transformation" do
-      uuid = ElixirModuleLoader.generate_uuid()
-
-      {:ok, module} =
-        ElixirModuleLoader.register_source(uuid, """
+      {:ok, key, module} =
+        ElixirModuleLoader.compile("""
         defmodule UC3MapTransform do
           def full_name(%{first: f, last: l} = person),
             do: Map.put(person, :full_name, f <> " " <> l)
         end
         """)
 
+      on_exit(fn ->
+        if ElixirModuleLoader.loaded?(key), do: ElixirModuleLoader.release(key)
+        Registry.unregister(key)
+      end)
+
       assert %{full_name: "Ada Lovelace"} =
                module.full_name(%{first: "Ada", last: "Lovelace"})
+    end
+  end
 
-      ElixirModuleLoader.unregister(uuid)
+  # ── UC: load_by_name for statically compiled modules ─────────────────────────
+
+  describe "load_by_name for known modules" do
+    test "load the built-in Math module and use it directly" do
+      {:ok, key, module} =
+        ElixirModuleLoader.load_by_name(SetmyInfo.ElixirModuleLoader.Modules.Math)
+
+      on_exit(fn ->
+        if ElixirModuleLoader.loaded?(key), do: ElixirModuleLoader.release(key)
+        Registry.unregister(key)
+      end)
+
+      assert 5 == module.add(2, 3)
+      assert 6 == module.multiply(2, 3)
+      assert {:error, :division_by_zero} == module.divide(1, 0)
     end
   end
 end

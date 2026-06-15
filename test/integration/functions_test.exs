@@ -1,205 +1,164 @@
 defmodule SetmyInfo.ElixirModuleLoader.Integration.FunctionsTest do
   @moduledoc """
-  Integration tests for loadable *functions*: single functions as catalog
-  entries, first-class captures, higher-order passing, compositions
-  registered under their own keys, currying, and pure-function memoisation.
+  Integration tests for runtime function discovery: listing exports and
+  calling dynamically discovered functions without knowing them in advance.
+  The caller owns the dispatch — the library provides only the module.
   """
 
   use ExUnit.Case, async: false
 
   alias SetmyInfo.ElixirModuleLoader
-  alias SetmyInfo.ElixirModuleLoader.Fn
+  alias SetmyInfo.ElixirModuleLoader.Registry
 
-  describe "function targets" do
-    test "a {m, f, a} registers under its own key; fun/1 captures it" do
-      uuid = ElixirModuleLoader.generate_uuid()
-      :ok = ElixirModuleLoader.register_function(uuid, {String, :upcase, 1})
-
-      up = ElixirModuleLoader.fun(uuid)
-      assert "HI" == up.("hi")
-      assert ["A", "B"] == Enum.map(["a", "b"], up)
-
-      assert {:ok, [upcase: 1]} = ElixirModuleLoader.functions(uuid)
-
-      ElixirModuleLoader.unregister(uuid)
-    end
-  end
-
-  describe "first-class captures of module functions" do
-    test "fun/3 captures by name and arity, late-bound through the key" do
-      uuid = ElixirModuleLoader.generate_uuid()
-      :ok = ElixirModuleLoader.register(uuid, SetmyInfo.ElixirModuleLoader.Modules.Math)
-
-      add = ElixirModuleLoader.fun(uuid, :add, 2)
-      assert 5 == add.(2, 3)
-
-      # Survives a release: the closure re-loads through the key.
-      if ElixirModuleLoader.loaded?(uuid), do: ElixirModuleLoader.release(uuid)
-      assert 7 == add.(3, 4)
-
-      ElixirModuleLoader.release(uuid)
-      ElixirModuleLoader.unregister(uuid)
-    end
-  end
-
-  describe "higher-order functions across keys" do
-    test "a loaded combinator receives a captured loaded function as argument" do
-      mapper_uuid = ElixirModuleLoader.generate_uuid()
-      f_uuid = ElixirModuleLoader.generate_uuid()
-
-      {:ok, mapper} =
-        ElixirModuleLoader.register_source(mapper_uuid, """
-        defmodule HOFMapper do
-          def map_with(fun, list), do: Enum.map(list, fun)
+  describe "functions/1 — runtime export discovery" do
+    test "lists all public functions of a compiled module" do
+      {:ok, key, _module} =
+        ElixirModuleLoader.compile("""
+        defmodule SetmyInfo.ElixirModuleLoader.Integration.FnDiscover do
+          def alpha(x), do: x
+          def beta(x, y), do: {x, y}
+          def gamma, do: :gamma
         end
         """)
-
-      :ok = ElixirModuleLoader.register_function(f_uuid, {String, :upcase, 1})
-
-      # fun/1 gives a plain closure — pass it to loaded code like any value.
-      up = ElixirModuleLoader.fun(f_uuid)
-      assert ["A", "B"] == mapper.map_with(up, ["a", "b"])
-
-      ElixirModuleLoader.release(mapper_uuid)
-      ElixirModuleLoader.unregister(mapper_uuid)
-      ElixirModuleLoader.unregister(f_uuid)
-    end
-  end
-
-  describe "compositions as catalog entries" do
-    setup do
-      trim = ElixirModuleLoader.generate_uuid()
-      up = ElixirModuleLoader.generate_uuid()
-      :ok = ElixirModuleLoader.register_function(trim, {String, :trim, 1})
-      :ok = ElixirModuleLoader.register_function(up, {String, :upcase, 1})
 
       on_exit(fn ->
-        for u <- [trim, up] do
-          if ElixirModuleLoader.loaded?(u), do: ElixirModuleLoader.release(u)
-          ElixirModuleLoader.unregister(u)
-        end
+        if ElixirModuleLoader.loaded?(key), do: ElixirModuleLoader.release(key)
+        Registry.unregister(key)
       end)
 
-      {:ok, trim: trim, up: up}
+      {:ok, exports} = ElixirModuleLoader.functions(key)
+      assert {:alpha, 1} in exports
+      assert {:beta, 2} in exports
+      assert {:gamma, 0} in exports
     end
 
-    test "a pipe of refs registered under its own key is a new function", ctx do
-      pipe_uuid = ElixirModuleLoader.generate_uuid()
-      ast = {:pipe, [{:ref, ctx.trim}, {:ref, ctx.up}]}
-      :ok = ElixirModuleLoader.register_composite(pipe_uuid, ast)
-
-      f = ElixirModuleLoader.fun(pipe_uuid)
-      assert "HELLO" == f.("  hello ")
-
-      # Composites are catalog entries: discoverable and recursively usable.
-      assert {:ok, [call: 1]} = ElixirModuleLoader.functions(pipe_uuid)
-
-      outer_uuid = ElixirModuleLoader.generate_uuid()
-      :ok = ElixirModuleLoader.register_composite(outer_uuid, {:pipe, [{:ref, pipe_uuid}]})
-      assert "X" == ElixirModuleLoader.fun(outer_uuid).(" x ")
-
-      ElixirModuleLoader.unregister(pipe_uuid)
-      ElixirModuleLoader.unregister(outer_uuid)
-    end
-
-    test "pipelines short-circuit on the first {:error, _} stage result", ctx do
-      failer = ElixirModuleLoader.generate_uuid()
-
-      {:ok, _} =
-        ElixirModuleLoader.register_source(failer, """
-        defmodule PipeFailer do
-          def fail(_), do: {:error, :stage_failed}
-        end
-        """)
-
-      pipe_uuid = ElixirModuleLoader.generate_uuid()
-      ast = {:pipe, [{:ref, ctx.trim}, {:ref, failer, :fail}, {:ref, ctx.up}]}
-      :ok = ElixirModuleLoader.register_composite(pipe_uuid, ast)
-
-      assert {:error, :stage_failed} == ElixirModuleLoader.fun(pipe_uuid).("  hello ")
-
-      for u <- [pipe_uuid, failer] do
-        if ElixirModuleLoader.loaded?(u), do: ElixirModuleLoader.release(u)
-        ElixirModuleLoader.unregister(u)
-      end
-    end
-
-    test "malformed composite ASTs are rejected" do
-      uuid = ElixirModuleLoader.generate_uuid()
-
-      assert {:error, :invalid_composite} =
-               ElixirModuleLoader.register_composite(uuid, {:pipe, []})
-
-      assert {:error, :invalid_composite} = ElixirModuleLoader.register_composite(uuid, :nonsense)
-    end
-  end
-
-  describe "currying and partial application" do
-    test "Fn.partial binds leading arguments" do
-      uuid = ElixirModuleLoader.generate_uuid()
-      :ok = ElixirModuleLoader.register(uuid, SetmyInfo.ElixirModuleLoader.Modules.Math)
-
-      add5 = Fn.partial(uuid, :add, [5])
-      assert 8 == add5.(3)
-      assert [6, 7] == Enum.map([1, 2], add5)
-
-      ElixirModuleLoader.release(uuid)
-      ElixirModuleLoader.unregister(uuid)
-    end
-
-    test "a {:partial, ...} composite node is a registrable curried function" do
-      uuid = ElixirModuleLoader.generate_uuid()
-      math = ElixirModuleLoader.generate_uuid()
-      :ok = ElixirModuleLoader.register(math, SetmyInfo.ElixirModuleLoader.Modules.Math)
-
-      :ok = ElixirModuleLoader.register_composite(uuid, {:partial, math, :add, [100]})
-      assert 103 == ElixirModuleLoader.fun(uuid).(3)
-
-      for u <- [uuid, math] do
-        if ElixirModuleLoader.loaded?(u), do: ElixirModuleLoader.release(u)
-        ElixirModuleLoader.unregister(u)
-      end
-    end
-  end
-
-  describe "pure functions: memoisation" do
-    test "pure results are memoised per {key, args}" do
-      uuid = ElixirModuleLoader.generate_uuid()
-
-      {:ok, _} =
+    test "functions/1 loads the module if not yet in working set" do
+      {:ok, key, _module} =
         ElixirModuleLoader.compile("""
-        defmodule PureCounter do
-          def slow_double(x) do
-            send(:pure_test_listener, {:computed, x})
-            x * 2
-          end
+        defmodule SetmyInfo.ElixirModuleLoader.Integration.FnAutoLoad do
+          def hello, do: :world
         end
         """)
 
-      # The name unregisters itself when the test process exits.
-      Process.register(self(), :pure_test_listener)
+      ElixirModuleLoader.release(key)
+      refute ElixirModuleLoader.loaded?(key)
 
-      :ok = ElixirModuleLoader.register_function(uuid, {PureCounter, :slow_double, 1}, pure: true)
-      double = ElixirModuleLoader.fun(uuid)
+      {:ok, exports} = ElixirModuleLoader.functions(key)
+      assert {:hello, 0} in exports
+      assert ElixirModuleLoader.loaded?(key)
 
-      assert 42 == double.(21)
-      assert_received {:computed, 21}
+      on_exit(fn ->
+        if ElixirModuleLoader.loaded?(key), do: ElixirModuleLoader.release(key)
+        Registry.unregister(key)
+      end)
+    end
 
-      # Same args — served from the memo cache.
-      assert 42 == double.(21)
-      refute_received {:computed, 21}
+    test "accepts UUID string for key" do
+      {:ok, key, _module} =
+        ElixirModuleLoader.compile("""
+        defmodule SetmyInfo.ElixirModuleLoader.Integration.FnUUID do
+          def ping, do: :pong
+        end
+        """)
 
-      # Different args compute again.
-      assert 6 == double.(3)
-      assert_received {:computed, 3}
+      uuid = ElixirModuleLoader.key_to_uuid(key)
 
-      # Unregistering clears the cache.
-      ElixirModuleLoader.unregister(uuid)
-      :ok = ElixirModuleLoader.register_function(uuid, {PureCounter, :slow_double, 1}, pure: true)
-      assert 42 == ElixirModuleLoader.fun(uuid).(21)
-      assert_received {:computed, 21}
+      on_exit(fn ->
+        if ElixirModuleLoader.loaded?(key), do: ElixirModuleLoader.release(key)
+        Registry.unregister(key)
+      end)
 
-      ElixirModuleLoader.unregister(uuid)
+      {:ok, exports} = ElixirModuleLoader.functions(uuid)
+      assert {:ping, 0} in exports
+    end
+  end
+
+  describe "calling dynamically discovered functions" do
+    test "discover all arity-1 functions and call them" do
+      {:ok, key, _module} =
+        ElixirModuleLoader.compile("""
+        defmodule SetmyInfo.ElixirModuleLoader.Integration.FnDynamic do
+          def shout(s), do: String.upcase(s)
+          def whisper(s), do: String.downcase(s)
+        end
+        """)
+
+      on_exit(fn ->
+        if ElixirModuleLoader.loaded?(key), do: ElixirModuleLoader.release(key)
+        Registry.unregister(key)
+      end)
+
+      {:ok, exports} = ElixirModuleLoader.functions(key)
+      {:ok, module} = ElixirModuleLoader.load(key)
+
+      results =
+        for {name, 1} <- exports, into: %{} do
+          {name, apply(module, name, ["Hey"])}
+        end
+
+      assert results == %{shout: "HEY", whisper: "hey"}
+    end
+
+    test "caller requests function by name using apply/3" do
+      {:ok, key, module} =
+        ElixirModuleLoader.compile("""
+        defmodule SetmyInfo.ElixirModuleLoader.Integration.FnByName do
+          def add(a, b), do: a + b
+          def multiply(a, b), do: a * b
+        end
+        """)
+
+      on_exit(fn ->
+        if ElixirModuleLoader.loaded?(key), do: ElixirModuleLoader.release(key)
+        Registry.unregister(key)
+      end)
+
+      function_name = :add
+      assert 7 == apply(module, function_name, [3, 4])
+
+      function_name = :multiply
+      assert 12 == apply(module, function_name, [3, 4])
+    end
+
+    test "caller verifies a function exists before calling it" do
+      {:ok, key, module} =
+        ElixirModuleLoader.compile("""
+        defmodule SetmyInfo.ElixirModuleLoader.Integration.FnCheck do
+          def transform(x), do: x * 2
+        end
+        """)
+
+      on_exit(fn ->
+        if ElixirModuleLoader.loaded?(key), do: ElixirModuleLoader.release(key)
+        Registry.unregister(key)
+      end)
+
+      {:ok, exports} = ElixirModuleLoader.functions(key)
+
+      if {:transform, 1} in exports do
+        assert 10 == apply(module, :transform, [5])
+      else
+        flunk("expected :transform/1 to be exported")
+      end
+
+      refute {:nonexistent, 1} in exports
+    end
+  end
+
+  describe "function discovery via load_by_name/1" do
+    test "discovers functions of a statically compiled module" do
+      {:ok, key, _module} =
+        ElixirModuleLoader.load_by_name(SetmyInfo.ElixirModuleLoader.Modules.Math)
+
+      on_exit(fn ->
+        if ElixirModuleLoader.loaded?(key), do: ElixirModuleLoader.release(key)
+        Registry.unregister(key)
+      end)
+
+      {:ok, exports} = ElixirModuleLoader.functions(key)
+      assert {:add, 2} in exports
+      assert {:multiply, 2} in exports
+      assert {:divide, 2} in exports
     end
   end
 end

@@ -1,6 +1,6 @@
 defmodule SetmyInfo.ElixirModuleLoader.Integration.ConcurrentTest do
   @moduledoc """
-  Integration test: concurrent register, load, call, and release from many
+  Integration test: concurrent compile, load, call, and release from many
   processes. Verifies that the GenServer-backed Registry and Loader are
   process-safe.
   """
@@ -8,28 +8,21 @@ defmodule SetmyInfo.ElixirModuleLoader.Integration.ConcurrentTest do
   use ExUnit.Case, async: false
 
   alias SetmyInfo.ElixirModuleLoader, as: EML
-  alias SetmyInfo.ElixirModuleLoader.{Compiler, Loader, Registry}
+  alias SetmyInfo.ElixirModuleLoader.Registry
 
-  @source """
-  defmodule SetmyInfo.ElixirModuleLoader.Integration.ConcurrentPlugin do
-    def double(n), do: n * 2
-  end
-  """
-
-  setup do
-    {:ok, _} = Compiler.from_source(@source)
-    :ok
-  end
-
-  test "many processes can register, load, call and release distinct keys without races" do
+  test "many processes compiling and loading distinct keys without races" do
     n = 20
 
     tasks =
       for i <- 1..n do
         Task.async(fn ->
-          key = :crypto.strong_rand_bytes(16)
-          :ok = Registry.register(key, SetmyInfo.ElixirModuleLoader.Integration.ConcurrentPlugin)
-          {:ok, module} = EML.load(key)
+          source = """
+          defmodule SetmyInfo.ElixirModuleLoader.Integration.ConcurrentMod#{i} do
+            def double(n), do: n * 2
+          end
+          """
+
+          {:ok, key, module} = EML.compile(source)
           assert i * 2 == module.double(i)
           :ok = EML.release(key)
           Registry.unregister(key)
@@ -37,16 +30,20 @@ defmodule SetmyInfo.ElixirModuleLoader.Integration.ConcurrentTest do
         end)
       end
 
-    results = Task.await_many(tasks, 5_000)
+    results = Task.await_many(tasks, 30_000)
     assert Enum.all?(results, &(&1 == :done))
   end
 
-  test "concurrent loads on the same key are idempotent" do
-    key = :crypto.strong_rand_bytes(16)
-    :ok = Registry.register(key, SetmyInfo.ElixirModuleLoader.Integration.ConcurrentPlugin)
+  test "concurrent loads on the same compiled key are idempotent" do
+    {:ok, key, _module} =
+      EML.compile("""
+      defmodule SetmyInfo.ElixirModuleLoader.Integration.ConcurrentShared do
+        def double(n), do: n * 2
+      end
+      """)
 
     on_exit(fn ->
-      if Loader.loaded?(key), do: Loader.release(key)
+      if EML.loaded?(key), do: EML.release(key)
       Registry.unregister(key)
     end)
 
@@ -57,9 +54,7 @@ defmodule SetmyInfo.ElixirModuleLoader.Integration.ConcurrentTest do
     assert [_one] = Enum.uniq(modules)
   end
 
-  test "hot swap: direct calls pick up new code without re-loading" do
-    key = :crypto.strong_rand_bytes(16)
-
+  test "hot swap: calls pick up new code after re-compile" do
     v1 = """
     defmodule SetmyInfo.ElixirModuleLoader.Integration.HotPlugin do
       def value, do: 1
@@ -72,18 +67,17 @@ defmodule SetmyInfo.ElixirModuleLoader.Integration.ConcurrentTest do
     end
     """
 
-    {:ok, _} = Compiler.from_source(v1)
-    :ok = Registry.register(key, SetmyInfo.ElixirModuleLoader.Integration.HotPlugin)
-    {:ok, module} = EML.load(key)
-
+    {:ok, key, module} = EML.compile(v1)
     assert 1 == module.value()
 
-    {:ok, _} = Compiler.from_source(v2)
+    on_exit(fn ->
+      if EML.loaded?(key), do: EML.release(key)
+      Registry.unregister(key)
+    end)
 
-    # Fully-qualified calls always hit the current code version.
+    {:ok, _key2, _module2} = EML.compile(v2)
     assert 99 == module.value()
 
     EML.release(key)
-    Registry.unregister(key)
   end
 end

@@ -1,99 +1,85 @@
 defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderTest do
   @moduledoc """
-  End-to-end test exercising the full public API facade (`ElixirModuleLoader`).
-
-  Uses the file-based fixture to verify compile-from-file, register, load,
-  direct call, and release — no execute/run dispatch, all calls are the
-  caller's responsibility after `load/1` returns the module.
+  End-to-end test exercising the full public API: compile, load, direct call,
+  and release. No dispatch layer — the caller owns all function invocations
+  after `load/1` returns the module.
   """
 
   use ExUnit.Case, async: false
 
+  alias SetmyInfo.ElixirModuleLoader, as: EML
+  alias SetmyInfo.ElixirModuleLoader.Registry
+
   @fixture_path Path.expand("../fixtures/sample_module.ex", __DIR__)
   @module SetmyInfo.ElixirModuleLoader.Support.SampleModule
 
-  setup do
-    key = SetmyInfo.ElixirModuleLoader.generate_key()
-
-    on_exit(fn ->
-      if SetmyInfo.ElixirModuleLoader.loaded?(key), do: SetmyInfo.ElixirModuleLoader.release(key)
-      SetmyInfo.ElixirModuleLoader.unregister(key)
-    end)
-
-    {:ok, key: key}
-  end
-
   test "generate_key/0 returns a 16-byte binary" do
-    key = SetmyInfo.ElixirModuleLoader.generate_key()
+    key = EML.generate_key()
     assert is_binary(key)
     assert byte_size(key) == 16
   end
 
-  test "full e2e: compile file → register → load → direct call → release", %{key: key} do
-    assert {:ok, _modules} = SetmyInfo.ElixirModuleLoader.compile_file(@fixture_path)
+  test "generate_uuid/0 returns a UUID string" do
+    uuid = EML.generate_uuid()
+    assert is_binary(uuid)
+    assert String.length(uuid) == 36
+  end
 
-    :ok = SetmyInfo.ElixirModuleLoader.register(key, @module)
-    assert SetmyInfo.ElixirModuleLoader.registered?(key)
-
-    {:ok, module} = SetmyInfo.ElixirModuleLoader.load(key)
-    assert SetmyInfo.ElixirModuleLoader.loaded?(key)
+  test "full e2e: compile file → load → direct call → release" do
+    {:ok, key, module} = EML.compile_file(@fixture_path)
+    assert module == @module
+    assert EML.loaded?(key)
 
     assert 10 == module.add(3, 7)
     assert 21 == module.multiply(3, 7)
     assert "hello" == module.echo("hello")
 
-    :ok = SetmyInfo.ElixirModuleLoader.release(key)
-    refute SetmyInfo.ElixirModuleLoader.loaded?(key)
+    :ok = EML.release(key)
+    refute EML.loaded?(key)
+
+    on_exit(fn -> Registry.unregister(key) end)
   end
 
-  test "load → call → release lifecycle", %{key: key} do
-    SetmyInfo.ElixirModuleLoader.compile_file(@fixture_path)
-    SetmyInfo.ElixirModuleLoader.register(key, @module)
+  test "load → call → release lifecycle" do
+    {:ok, key, module} = EML.compile_file(@fixture_path)
 
-    refute SetmyInfo.ElixirModuleLoader.loaded?(key)
-    {:ok, module} = SetmyInfo.ElixirModuleLoader.load(key)
+    assert EML.loaded?(key)
     assert 5 == module.add(2, 3)
-    :ok = SetmyInfo.ElixirModuleLoader.release(key)
-    refute SetmyInfo.ElixirModuleLoader.loaded?(key)
+    :ok = EML.release(key)
+    refute EML.loaded?(key)
+
+    on_exit(fn -> Registry.unregister(key) end)
   end
 
-  test "load is idempotent — multiple calls return same module", %{key: key} do
-    SetmyInfo.ElixirModuleLoader.compile_file(@fixture_path)
-    SetmyInfo.ElixirModuleLoader.register(key, @module)
+  test "load is idempotent — multiple calls return same module" do
+    {:ok, key, module} = EML.compile_file(@fixture_path)
 
-    {:ok, m1} = SetmyInfo.ElixirModuleLoader.load(key)
-    {:ok, m2} = SetmyInfo.ElixirModuleLoader.load(key)
+    {:ok, m1} = EML.load(key)
+    {:ok, m2} = EML.load(key)
     assert m1 == m2
+    assert m1 == module
     assert 5 == m1.add(2, 3)
-    assert 6 == m1.add(2, 4)
-    assert SetmyInfo.ElixirModuleLoader.loaded?(key)
+
+    on_exit(fn ->
+      if EML.loaded?(key), do: EML.release(key)
+      Registry.unregister(key)
+    end)
   end
 
-  test "reload/1 returns the module and keeps it callable", %{key: key} do
-    SetmyInfo.ElixirModuleLoader.compile_file(@fixture_path)
-    SetmyInfo.ElixirModuleLoader.register(key, @module)
-
-    {:ok, module} = SetmyInfo.ElixirModuleLoader.load(key)
+  test "release then reload restores from registered source" do
+    {:ok, key, module} = EML.compile_file(@fixture_path)
     assert 5 == module.add(2, 3)
 
-    {:ok, reloaded} = SetmyInfo.ElixirModuleLoader.reload(key)
-    assert reloaded == module
-    assert 5 == reloaded.add(2, 3)
+    :ok = EML.release(key)
+    {:ok, restored} = EML.load(key)
+    assert restored == module
+    assert 5 == restored.add(2, 3)
+
+    :ok = EML.release(key)
+    on_exit(fn -> Registry.unregister(key) end)
   end
 
-  test "load_beam_binary/2 loads module from BEAM binary and makes it callable", %{key: _key} do
-    {:ok, [{module, binary}]} = SetmyInfo.ElixirModuleLoader.compile_file(@fixture_path)
-    :code.purge(module)
-    :code.delete(module)
-    :code.purge(module)
-
-    assert :ok == SetmyInfo.ElixirModuleLoader.load_beam_binary(module, binary)
-    assert 5 == module.add(2, 3)
-  end
-
-  test "two distinct keys, two distinct modules loaded concurrently", %{key: key1} do
-    key2 = SetmyInfo.ElixirModuleLoader.generate_key()
-
+  test "two distinct keys, two distinct modules loaded concurrently" do
     source_a = """
     defmodule SetmyInfo.ElixirModuleLoader.E2E.PluginA do
       def value, do: :a
@@ -106,25 +92,51 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderTest do
     end
     """
 
-    {:ok, [{mod_a, _}]} = SetmyInfo.ElixirModuleLoader.compile(source_a)
-    {:ok, [{mod_b, _}]} = SetmyInfo.ElixirModuleLoader.compile(source_b)
-    SetmyInfo.ElixirModuleLoader.register(key1, mod_a)
-    SetmyInfo.ElixirModuleLoader.register(key2, mod_b)
+    {:ok, key1, m1} = EML.compile(source_a)
+    {:ok, key2, m2} = EML.compile(source_b)
 
     on_exit(fn ->
-      if SetmyInfo.ElixirModuleLoader.loaded?(key2),
-        do: SetmyInfo.ElixirModuleLoader.release(key2)
-
-      SetmyInfo.ElixirModuleLoader.unregister(key2)
+      if EML.loaded?(key1), do: EML.release(key1)
+      if EML.loaded?(key2), do: EML.release(key2)
+      Registry.unregister(key1)
+      Registry.unregister(key2)
     end)
-
-    {:ok, m1} = SetmyInfo.ElixirModuleLoader.load(key1)
-    {:ok, m2} = SetmyInfo.ElixirModuleLoader.load(key2)
 
     assert :a == m1.value()
     assert :b == m2.value()
 
-    SetmyInfo.ElixirModuleLoader.release(key1)
-    SetmyInfo.ElixirModuleLoader.release(key2)
+    EML.release(key1)
+    EML.release(key2)
+  end
+
+  test "load_by_name loads a statically compiled module" do
+    {:ok, key, module} = EML.load_by_name(@module)
+    assert module == @module
+    assert EML.loaded?(key)
+    assert 5 == module.add(2, 3)
+
+    :ok = EML.release(key)
+    refute EML.loaded?(key)
+
+    on_exit(fn -> Registry.unregister(key) end)
+  end
+
+  test "functions/1 discovers exports without knowing the module in advance" do
+    {:ok, key, _module} =
+      EML.compile("""
+      defmodule SetmyInfo.ElixirModuleLoader.E2E.DiscoverFixture do
+        def alpha(x), do: x
+        def beta(x, y), do: {x, y}
+      end
+      """)
+
+    on_exit(fn ->
+      if EML.loaded?(key), do: EML.release(key)
+      Registry.unregister(key)
+    end)
+
+    {:ok, exports} = EML.functions(key)
+    assert {:alpha, 1} in exports
+    assert {:beta, 2} in exports
   end
 end

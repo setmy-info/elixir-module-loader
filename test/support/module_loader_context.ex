@@ -4,9 +4,9 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderContext do
   import ExUnit.Assertions
 
   alias SetmyInfo.ElixirModuleLoader, as: EML
+  alias SetmyInfo.ElixirModuleLoader.Registry
   alias WhiteBread.Context.StepFunction
 
-  # A plain module — the library imposes no interface on loadable code.
   @source """
   defmodule SetmyInfo.ElixirModuleLoader.BDD.AddPlugin do
     def add(a, b), do: a + b
@@ -39,7 +39,14 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderContext do
   def scenario_starting_state(state), do: state
 
   @impl WhiteBread.ContextBehaviour
-  def scenario_finalize(_status, _state), do: nil
+  def scenario_finalize(_status, state) do
+    with %{key: key} <- state do
+      if EML.loaded?(key), do: EML.release(key)
+      Registry.unregister(key)
+    end
+
+    nil
+  end
 
   @impl WhiteBread.ContextBehaviour
   def feature_finalize(_status, _state), do: nil
@@ -48,19 +55,16 @@ defmodule SetmyInfo.ElixirModuleLoader.E2E.ModuleLoaderContext do
   def get_scenario_timeout(_feature, _scenario), do: 30_000
 
   def step_module_loader_running(state, _extra) do
-    key = EML.generate_key()
-    {:ok, _module} = EML.register_source(key, @source)
+    {:ok, key, _module} = EML.compile(@source)
     {:ok, Map.merge(state, %{key: key, module: nil, result: nil})}
   end
 
   def step_load_module(state, _extra) do
-    # Loading hands back the module itself — the caller owns the calls.
     {:ok, module} = EML.load(state.key)
     {:ok, %{state | module: module}}
   end
 
   def step_execute_add(state, %{a: a, b: b}) do
-    # Direct, dynamic invocation: the function name is data at runtime.
     result = apply(state.module, :add, [String.to_integer(a), String.to_integer(b)])
     {:ok, Map.put(state, :result, result)}
   end

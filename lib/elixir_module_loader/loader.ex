@@ -167,9 +167,6 @@ defmodule SetmyInfo.ElixirModuleLoader.Loader do
     end
   end
 
-  # Composite targets run on library code; nothing to restore.
-  defp ensure_code_loaded(_module, %{target: {:composite, _}}, _force), do: :ok
-
   defp ensure_code_loaded(module, meta, force) do
     if not force and :code.is_loaded(module) != false do
       :ok

@@ -23,9 +23,10 @@ defmodule SetmyInfo.ElixirModuleLoader.LoaderTest do
   end
 
   test "load returns the registered module", %{key: key} do
-    assert {:ok, SetmyInfo.ElixirModuleLoader.Test.LoaderFixture} = Loader.load(key)
+    assert {:ok, module} = Loader.load(key)
+    assert module == SetmyInfo.ElixirModuleLoader.Test.LoaderFixture
     assert Loader.loaded?(key)
-    assert :pong == SetmyInfo.ElixirModuleLoader.Test.LoaderFixture.ping()
+    assert :pong == module.ping()
   end
 
   test "load is idempotent", %{key: key} do
